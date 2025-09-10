@@ -8,6 +8,7 @@ import os
 # Third Party
 import aiofiles
 import aiofiles.os
+import xattr
 
 # First Party
 from lmcache.logging import init_logger
@@ -337,6 +338,16 @@ class FSConnector(RemoteConnector):
 
             # Atomically rename temp file to final destination
             await aiofiles.os.replace(temp_path, final_path)
+
+            # set xattr
+            if hasattr(key, "request_configs") and key.request_configs is not None:
+                for k, v in key.request_configs.items():
+                    if k.startswith("lmcache.remote.xattr."):
+                        xattr.setxattr(
+                            final_path,
+                            k[len("lmcache.remote.xattr.") :],
+                            str(v).encode("utf-8"),
+                        )
 
         except Exception as e:
             logger.error(f"Failed to write file {final_path}: {str(e)}")
