@@ -232,7 +232,8 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         """Check for finished aborted lookups and send cleanup messages to workers."""
         with self.lock:
             finished_lookups = [
-                lookup_id for lookup_id in self.aborted_lookups
+                lookup_id
+                for lookup_id in self.aborted_lookups
                 if self.reqs_status.get(lookup_id) is not None
             ]
             if finished_lookups:
@@ -315,14 +316,9 @@ class LMCacheAsyncLookupServer:
         while self.running:
             try:
                 msg_buf = self.pull_socket.recv(copy=False)
-                # Deserialize message - could be LookupRequestMsg or LookupCleanupMsg
-                # Use a union type for decoding
-                # Standard
-                from typing import Union as UnionType
-
                 msg = msgspec.msgpack.decode(
                     msg_buf,
-                    type=UnionType[LookupRequestMsg, LookupCleanupMsg],
+                    type=Union[LookupRequestMsg, LookupCleanupMsg],
                 )
 
                 if isinstance(msg, LookupRequestMsg):
