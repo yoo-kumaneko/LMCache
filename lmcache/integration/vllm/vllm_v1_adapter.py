@@ -47,6 +47,7 @@ from lmcache.config import LMCacheEngineMetadata
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
+    create_lmcache_metadata,
     extract_mm_features,
     lmcache_get_or_create_config,
     mla_enabled,
@@ -664,6 +665,7 @@ class LMCacheConnectorV1Impl:
             Generator[Optional[torch.Tensor], None, None]
         ] = []
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
+        self.lmcache_engine_metadata: LMCacheEngineMetadata
         if role == KVConnectorRole.SCHEDULER:
             self.lmcache_engine: Optional[LMCacheEngine] = None
             # Check if bypass lookup is enabled for scheduler
@@ -674,26 +676,18 @@ class LMCacheConnectorV1Impl:
                     vllm_config,
                     role="scheduler",
                 )
+                self.lmcache_engine_metadata = self.lmcache_engine.metadata
             else:
                 self.lmcache_engine = None
                 # Create a dummy metadata for create prometheus logger
                 # kv_dtype kv_shape and use_mla are dummy data
-                # TODO(baoloongmao): PrometheusLogger should be initialized without
-                #  having to create some dummy data in the future
-                metadata = LMCacheEngineMetadata(
-                    model_name=vllm_config.model_config.model,
-                    world_size=vllm_config.parallel_config.world_size,
-                    worker_id=0,
-                    fmt="vllm",
-                    kv_dtype=torch.bfloat16,
-                    kv_shape=(1, 1, 1, 1, 1),
-                    use_mla=False,
-                    role="scheduler",
+                self.lmcache_engine_metadata, _ = create_lmcache_metadata(
+                    vllm_config, role="scheduler"
                 )
-                PrometheusLogger.GetOrCreate(metadata)
+                PrometheusLogger.GetOrCreate(self.lmcache_engine_metadata)
             # Create lookup client using factory
             self.lookup_client = LookupClientFactory.create_lookup_client(
-                vllm_config, config, self.lmcache_engine
+                vllm_config, config, self.lmcache_engine_metadata, self.lmcache_engine
             )
             self._unfinished_requests: dict[str, Request] = {}
         else:
