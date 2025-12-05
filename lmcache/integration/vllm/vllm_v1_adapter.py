@@ -211,10 +211,17 @@ class RequestTracker:
 
         mm_hashes, mm_positions = extract_mm_features(new_request, modify=True)
 
+        # In case of P/D disaggregated inference, the new request the
+        # decode node gets will include the first output token.
+        token_ids = (
+            new_request.prompt_token_ids[:num_tokens_to_compute].copy()
+            + new_request.output_token_ids.copy()
+        )
+
         return RequestTracker(
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
-            token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
+            token_ids=token_ids,
             allocated_block_ids=unfolded_block_ids,
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
@@ -1689,9 +1696,21 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens = 0
                 if load_spec is not None:
                     lmcache_cached_tokens = load_spec.lmcache_cached_tokens
+
+                # When VLLM_FUSED_MTP_MODEL is enabled, use total_new_token_ids
+                # which includes accepted speculative tokens
+                tokens_to_add = req.new_token_ids
+                if hasattr(req, "total_new_token_ids"):
+                    tokens_to_add = req.total_new_token_ids
+                    logger.debug(
+                        f"Request {req.req_id}: Using total_new_token_ids "
+                        f"(includes accepted spec tokens). "
+                        f"new_token_ids={len(req.new_token_ids)}, "
+                        f"total_new_token_ids={len(req.total_new_token_ids)}"
+                    )
                 request_tracker = self._request_trackers[req.req_id]
                 request_tracker.update(
-                    req.new_token_ids,
+                    tokens_to_add,
                     req.new_block_ids,
                     req.resumed_from_preemption,
                     lmcache_cached_tokens=lmcache_cached_tokens,
