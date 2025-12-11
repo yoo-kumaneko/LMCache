@@ -213,9 +213,8 @@ class RequestTracker:
 
         # In case of P/D disaggregated inference, the new request the
         # decode node gets will include the first output token.
-        token_ids = (
-            new_request.prompt_token_ids[:num_tokens_to_compute].copy()
-            + new_request.output_token_ids.copy()
+        token_ids = new_request.prompt_token_ids[:num_tokens_to_compute].copy() + list(
+            new_request.output_token_ids
         )
 
         return RequestTracker(
