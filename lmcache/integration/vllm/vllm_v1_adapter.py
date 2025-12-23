@@ -213,10 +213,16 @@ class RequestTracker:
 
         mm_hashes, mm_positions = extract_mm_features(new_request, modify=True)
 
+        # In case of P/D disaggregated inference, the new request the
+        # decode node gets will include the first output token.
+        token_ids = new_request.prompt_token_ids[:num_tokens_to_compute].copy() + list(
+            new_request.output_token_ids
+        )
+
         return RequestTracker(
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
-            token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
+            token_ids=token_ids,
             allocated_block_ids=unfolded_block_ids,
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
@@ -1767,8 +1773,15 @@ class LMCacheConnectorV1Impl:
                     )
                     all_token_ids = list(vllm_request.all_token_ids)
 
+                if hasattr(req, "overlap_new_token_ids"):
+                    tokens_to_add = req.overlap_new_token_ids
+                elif hasattr(req, "total_new_token_ids"):
+                    tokens_to_add = req.total_new_token_ids
+                else:
+                    tokens_to_add = req.new_token_ids
+
                 request_tracker.update(
-                    req.new_token_ids,
+                    tokens_to_add,
                     req.new_block_ids,
                     req.resumed_from_preemption,
                     lmcache_cached_tokens=lmcache_cached_tokens,
