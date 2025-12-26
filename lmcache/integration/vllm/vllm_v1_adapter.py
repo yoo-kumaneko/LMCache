@@ -750,11 +750,6 @@ class LMCacheConnectorV1Impl:
                 get_tensor_model_parallel_rank(),
             )
 
-            # In case of MLA, the lookup server is only created on worker 0
-            if self.async_loading and self.lookup_server is not None:
-                assert isinstance(self.lookup_server, LMCacheAsyncLookupServer)
-                self.lmcache_engine.post_init(async_lookup_server=self.lookup_server)
-
         self.kv_caches: dict[str, torch.Tensor] = {}
 
         self._block_size = vllm_config.cache_config.block_size
@@ -949,7 +944,13 @@ class LMCacheConnectorV1Impl:
         self._build_kv_layer_groups()
         if self.lmcache_engine is not None:
             kvcaches = list(self.kv_caches.values())
-            self.lmcache_engine.post_init(kvcaches=kvcaches)
+            async_lookup_server = None
+            if self.async_loading and self.lookup_server is not None:
+                assert isinstance(self.lookup_server, LMCacheAsyncLookupServer)
+                async_lookup_server = self.lookup_server
+            self.lmcache_engine.post_init(
+                kvcaches=kvcaches, async_lookup_server=async_lookup_server
+            )
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -967,6 +968,10 @@ class LMCacheConnectorV1Impl:
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
+            logger.warning(
+                "Please update LMCacheConnector, "
+                "use register_kv_caches to init kv_caches"
+            )
             self._init_kv_caches_from_forward_context(forward_context)
 
         metadata = self._parent._get_connector_metadata()
