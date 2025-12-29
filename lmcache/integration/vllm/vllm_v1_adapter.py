@@ -692,6 +692,9 @@ class LMCacheConnectorV1Impl:
         self.layerwise_storers: list[Generator[Optional[torch.Tensor], None, None]] = []
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.lmcache_engine_metadata: LMCacheEngineMetadata
+        self.decode_write_back = self.config.extra_config.get(
+            "decode_write_back", False
+        )
         if role == KVConnectorRole.SCHEDULER:
             self.lmcache_engine: Optional[LMCacheEngine] = None
             # Check if bypass lookup is enabled for scheduler
@@ -1723,6 +1726,8 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens,
                 skip_save,
             )
+            if self.decode_write_back:
+                request_tracker.num_saved_tokens = len(request.prompt_token_ids)
             self._request_trackers[request.req_id] = request_tracker
 
             req_meta = ReqMeta.from_request_tracker(
