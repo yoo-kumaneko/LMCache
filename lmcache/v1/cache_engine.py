@@ -989,7 +989,49 @@ class LMCacheEngine:
             # all tokens where found, return the maximal end
             return res
         finally:
-            self.stats_monitor.on_lookup_finished(lookup_request_id, res)
+            # When num_computed_tokens is greater than a chunk, we skip
+            # some tokens to reduce the number of lookup requests.
+            # It is possible that res equals aligned_computed_tokens and no lookup is
+            # performed.
+            # In this case, using res as the number of hit tokens will overcount
+            # the number of hit tokens.
+            # TODO deprecate this metric and use retrieve metrics instead.
+
+            # Track hit tokens by node type (prefill vs decode)
+            hit_tokens_from_prefill = 0
+            hit_tokens_from_decode = 0
+
+            # We had hits, count tokens by pd_role for each hit chunk
+            try:
+                for start, end, key in self.token_database.process_tokens(
+                    tokens=tokens,
+                    hashes=hashes,
+                    offsets=offsets,
+                    request_configs=request_configs,
+                ):
+                    if end > res:
+                        # Beyond the hit range
+                        break
+
+                    # This chunk was a hit, get its pd_role
+                    pd_role = self.storage_manager.get_pd_role(key, search_range)
+                    logger.warning(f"pd_role: {pd_role}")
+                    num_tokens = end - start
+
+                    if pd_role == "prefill":
+                        hit_tokens_from_prefill += num_tokens
+                    elif pd_role == "decode":
+                        hit_tokens_from_decode += num_tokens
+                    # If pd_role is None, we don't count it in either category
+
+            except Exception as e:
+                logger.debug(f"Failed to get pd_role during lookup: {e}")
+
+            # Report to stats monitor with breakdown by node type
+            self.stats_monitor.on_lookup_finished(
+                lookup_request_id, res, hit_tokens_from_prefill, hit_tokens_from_decode
+            )
+
             # vllm lookup sets pin to True
             if pin:
                 self.storage_manager.touch_cache()

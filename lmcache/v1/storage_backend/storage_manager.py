@@ -790,6 +790,32 @@ class StorageManager:
 
         return None
 
+    def get_pd_role(
+        self,
+        key: CacheEngineKey,
+        search_range: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """
+        Get the pd_role metadata for a key without loading the full chunk.
+
+        :param CacheEngineKey key: The key to check.
+        :param Optional[List[str]] search_range: The range of storage backends to search.
+
+        :return: The pd_role ("prefill" or "decode") or None if not found/supported.
+        """
+        for backend_name, backend in self.get_active_storage_backends(
+            search_range=search_range
+        ):
+            if backend.contains(key, False):
+                # Found the key, try to get pd_role
+                if hasattr(backend, "get_pd_role"):
+                    pd_role = backend.get_pd_role(key)
+                    if pd_role is not None:
+                        return pd_role
+                # If backend doesn't support get_pd_role, return None
+                return None
+        return None
+
     def batched_contains(
         self,
         keys: List[CacheEngineKey],
