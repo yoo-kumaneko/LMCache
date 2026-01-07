@@ -129,6 +129,10 @@ class InstrumentedRemoteConnector(RemoteConnector):
     def support_batched_contains(self) -> bool:
         return self._connector.support_batched_contains()
 
+    def get_pd_role_sync(self, key: CacheEngineKey) -> Optional[str]:
+        """Forward pd_role metadata query to underlying connector"""
+        return self._connector.get_pd_role_sync(key)
+
     def reshape_partial_chunk(
         self, memory_obj: MemoryObj, bytes_read: int
     ) -> MemoryObj:

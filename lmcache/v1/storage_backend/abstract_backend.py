@@ -256,6 +256,16 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    def get_pd_role(self, key: CacheEngineKey) -> Optional[str]:
+        """
+        Get the pd_role metadata for a key without loading the full chunk.
+
+        :param CacheEngineKey key: The key to check.
+
+        :return: The pd_role ("prefill" or "decode") or None if not found/supported.
+        """
+        return None
+
     def batched_contains(
         self,
         keys: List[CacheEngineKey],

@@ -45,6 +45,7 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         - `full_chunk_size` is the size of the lmcache full chunk.
         - `single_token_size` is the size of a single token.`
         - `remote_metadata_bytes` is the size of the remote metadata.
+        - `pd_role` is the role of the instance in PD disaggregated inference.
 
         Input:
             config: the lmcache engine config
@@ -66,18 +67,28 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         assert self.full_chunk_size % metadata.chunk_size == 0
         self.single_token_size = self.full_chunk_size // metadata.chunk_size
 
+        # Determine node type (Prefill=0 or Decode=1) for PD disaggregated inference
+        # This flag will be stored in the chunk metadata to track which type of node saved it
+        self.pd_role = (
+            "decode"
+            if config.get_extra_config_value("is_decode_instance", False)
+            else "prefill"
+        )
+
         # init remote metadata info
         init_remote_metadata_info(metadata.get_num_groups())
         self.remote_metadata_bytes = get_remote_metadata_bytes()
         logger.info(
             "init remote connector metadata info, shapes: %s, dtypes: %s, fmt: %s, "
-            "full chunk size: %s, single token size: %s, remote metadata bytes: %s",
+            "full chunk size: %s, single token size: %s, remote metadata bytes: %s, "
+            "pd_role: %s (node type flag for chunk metadata)",
             self.meta_shapes,
             self.meta_dtypes,
             self.meta_fmt,
             self.full_chunk_size,
             self.single_token_size,
             self.remote_metadata_bytes,
+            self.pd_role,
         )
 
     @NotAudit
@@ -349,6 +360,16 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         Is supported batched_contains
         """
         return False
+
+    def get_pd_role_sync(self, key: CacheEngineKey) -> Optional[str]:
+        """
+        Synchronously read only the pd_role from chunk metadata.
+        Returns None if not supported or on error.
+
+        :param CacheEngineKey key: The key to check.
+        :return: The pd_role string ("prefill" or "decode") or None
+        """
+        return None
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}>"

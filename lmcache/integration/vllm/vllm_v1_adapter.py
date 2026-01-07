@@ -1557,6 +1557,10 @@ class LMCacheConnectorV1Impl:
                 token_ids = token_ids.tolist()
 
             request_configs = extract_request_configs(request.sampling_params)
+            if request_configs is None:
+                request_configs = {}
+            request_configs["num_computed_tokens"] = num_computed_tokens
+
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
