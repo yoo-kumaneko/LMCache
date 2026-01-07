@@ -147,6 +147,34 @@ class FSConnector(RemoteConnector):
         file_path = self._get_file_path(key)
         return os.path.exists(file_path)
 
+    def get_pd_role_sync(self, key: CacheEngineKey) -> Optional[str]:
+        """
+        Synchronously read only the pd_role from chunk metadata.
+        Returns None if chunk doesn't exist, metadata is not saved, or on error.
+        """
+        if not self.save_chunk_meta:
+            return None
+
+        file_path = self._get_file_path(key)
+        if not os.path.exists(file_path):
+            return None
+
+        try:
+            with open(file_path, "rb") as f:
+                # Read only the metadata header
+                md_buffer = bytearray(self.remote_metadata_bytes)
+                num_read = f.read(self.remote_metadata_bytes)
+                if len(num_read) != self.remote_metadata_bytes:
+                    return None
+                md_buffer[:] = num_read
+
+                # Deserialize and extract pd_role
+                metadata = RemoteMetadata.deserialize(md_buffer)
+                return metadata.pd_role
+        except Exception as e:
+            logger.debug(f"Failed to read pd_role for {key.to_string()}: {e}")
+            return None
+
     def _get_with_odirect(self, file_path: Path) -> Optional[MemoryObj]:
         """Synchronous direct IO read, executed in a thread."""
         fd = -1
@@ -294,11 +322,11 @@ class FSConnector(RemoteConnector):
                     pass
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
-        """Store data to file system"""
+        """Store data to file system with node type metadata"""
         final_path, temp_path = self._get_file_and_tmp_path(key)
 
         try:
-            # Prepare metadata
+            # Prepare metadata with node type flag (P=prefill/0, D=decode/1)
             buffer = memory_obj.byte_array
             metadata = (
                 RemoteMetadata(
@@ -306,9 +334,14 @@ class FSConnector(RemoteConnector):
                     memory_obj.get_shapes(),
                     memory_obj.get_dtypes(),
                     memory_obj.get_memory_format(),
+                    self.pd_role,  # Store node type: "prefill" or "decode"
                 )
                 if self.save_chunk_meta
                 else None
+            )
+
+            logger.debug(
+                f"Saving chunk {key.to_string()} with node type: {self.pd_role}"
             )
 
             size = len(buffer)

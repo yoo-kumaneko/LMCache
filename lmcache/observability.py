@@ -28,6 +28,8 @@ class LMCacheStats:
     interval_lookup_requests: int
     interval_requested_tokens: int
     interval_hit_tokens: int
+    interval_hit_tokens_from_prefill: int  # Hit tokens from prefill nodes
+    interval_hit_tokens_from_decode: int  # Hit tokens from decode nodes
     interval_stored_tokens: int
     interval_lookup_tokens: int
     interval_lookup_hits: int
@@ -160,6 +162,8 @@ class LMCStatsMonitor:
         self.interval_lookup_requests = 0
         self.interval_requested_tokens = 0  # total requested tokens retrieve
         self.interval_hit_tokens = 0  # total hit tokens retrieve
+        self.interval_hit_tokens_from_prefill = 0  # hit tokens from prefill nodes
+        self.interval_hit_tokens_from_decode = 0  # hit tokens from decode nodes
         self.interval_stored_tokens = 0  # total tokens tored in LMCache
         self.interval_lookup_tokens = 0  # total requested tokens lookup
         self.interval_lookup_hits = 0  # total hit tokens lookup
@@ -231,16 +235,33 @@ class LMCStatsMonitor:
         return self.lookup_request_id - 1
 
     @thread_safe
-    def on_lookup_finished(self, request_id: int, num_hit_tokens: int):
+    def on_lookup_finished(
+        self,
+        request_id: int,
+        num_hit_tokens: int,
+        hit_tokens_from_prefill: int = 0,
+        hit_tokens_from_decode: int = 0,
+    ):
         """
         This function is called when a lookup request is finished.
-        It will record the number of tokens hit.
+        It will record the number of tokens hit and track by node type.
+
+        Args:
+            request_id: Internal request ID
+            num_hit_tokens: Total number of tokens found in lookup
+            hit_tokens_from_prefill: Number of hit tokens from prefill nodes
+            hit_tokens_from_decode: Number of hit tokens from decode nodes
         """
         assert request_id in self.lookup_requests
         lookup_stats = self.lookup_requests[request_id]
         lookup_stats.hit_tokens = num_hit_tokens
         lookup_stats.is_finished = True
         self.interval_lookup_hits += num_hit_tokens
+
+        # Track hits by node type
+        self.interval_hit_tokens_from_prefill += hit_tokens_from_prefill
+        self.interval_hit_tokens_from_decode += hit_tokens_from_decode
+
         if num_hit_tokens == 0:
             self.interval_lookup_0_hit_requests += 1
 
@@ -407,6 +428,8 @@ class LMCStatsMonitor:
 
         self.interval_requested_tokens = 0
         self.interval_hit_tokens = 0
+        self.interval_hit_tokens_from_prefill = 0
+        self.interval_hit_tokens_from_decode = 0
         self.interval_stored_tokens = 0
         self.interval_lookup_tokens = 0
         self.interval_lookup_hits = 0
@@ -526,6 +549,8 @@ class LMCStatsMonitor:
             interval_lookup_requests=self.interval_lookup_requests,
             interval_requested_tokens=self.interval_requested_tokens,
             interval_hit_tokens=self.interval_hit_tokens,
+            interval_hit_tokens_from_prefill=self.interval_hit_tokens_from_prefill,
+            interval_hit_tokens_from_decode=self.interval_hit_tokens_from_decode,
             interval_stored_tokens=self.interval_stored_tokens,
             interval_lookup_tokens=self.interval_lookup_tokens,
             interval_lookup_hits=self.interval_lookup_hits,
@@ -634,6 +659,18 @@ class PrometheusLogger:
         self.counter_num_hit_tokens = self._counter_cls(
             name="lmcache:num_hit_tokens",
             documentation="Total number of tokens hit in lmcache",
+            labelnames=labelnames,
+        )
+
+        self.counter_num_hit_tokens_from_prefill = self._counter_cls(
+            name="lmcache:num_hit_tokens_from_prefill",
+            documentation="Total number of hit tokens from prefill nodes",
+            labelnames=labelnames,
+        )
+
+        self.counter_num_hit_tokens_from_decode = self._counter_cls(
+            name="lmcache:num_hit_tokens_from_decode",
+            documentation="Total number of hit tokens from decode nodes",
             labelnames=labelnames,
         )
 
@@ -1206,6 +1243,14 @@ class PrometheusLogger:
             self.counter_num_requested_tokens, stats.interval_requested_tokens
         )
         self._log_counter(self.counter_num_hit_tokens, stats.interval_hit_tokens)
+        self._log_counter(
+            self.counter_num_hit_tokens_from_prefill,
+            stats.interval_hit_tokens_from_prefill,
+        )
+        self._log_counter(
+            self.counter_num_hit_tokens_from_decode,
+            stats.interval_hit_tokens_from_decode,
+        )
         self._log_counter(self.counter_num_stored_tokens, stats.interval_stored_tokens)
         self._log_counter(self.counter_num_lookup_tokens, stats.interval_lookup_tokens)
         self._log_counter(self.counter_num_lookup_hits, stats.interval_lookup_hits)

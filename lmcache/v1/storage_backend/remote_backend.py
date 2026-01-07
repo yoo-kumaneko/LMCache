@@ -496,6 +496,24 @@ class RemoteBackend(StorageBackendInterface):
             )
             return False
 
+    def get_pd_role(self, key: CacheEngineKey) -> Optional[str]:
+        """
+        Read the pd_role metadata for a key without loading the full chunk.
+        Returns None if connection is unavailable or pd_role cannot be determined.
+        """
+        if self.connection is None:
+            return None
+
+        # For MLA worker id as 0 mode, use worker_id 0
+        if self._mla_worker_id_as0_mode:
+            key = key.with_new_worker_id(0)
+
+        try:
+            return self.connection.get_pd_role_sync(key)
+        except Exception as e:
+            logger.debug(f"Failed to get pd_role for {key.to_string()}: {e}")
+            return None
+
     def get_allocator_backend(self):
         assert self.local_cpu_backend is not None, (
             "local_cpu_backend is required for get_allocator_backend, "

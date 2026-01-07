@@ -73,12 +73,27 @@ INT_TO_LOCATION = {
     2: "LocalDiskBackend",
 }
 
+# Node type flags for PD (Prefill-Decode) disaggregated inference
+# These flags are stored in chunk metadata to track which type of node saved the chunk
+PD_ROLE_PREFILL = 0  # Prefill node (P)
+PD_ROLE_DECODE = 1  # Decode node (D)
+
+PD_ROLE_TO_INT = {
+    "prefill": PD_ROLE_PREFILL,
+    "decode": PD_ROLE_DECODE,
+}
+
+INT_TO_PD_ROLE = {
+    PD_ROLE_PREFILL: "prefill",
+    PD_ROLE_DECODE: "decode",
+}
+
 
 def init_remote_metadata_info(num_groups: int):
     global REMOTE_METADATA_FMT
     global REMOTE_METADATA_BYTES
-    # length, fmt, (dtype, shape0, shape1, shape2, shape3) * num_groups
-    fmt_length = 2 + 5 * num_groups
+    # length, fmt, pd_role, (dtype, shape0, shape1, shape2, shape3) * num_groups
+    fmt_length = 3 + 5 * num_groups
     REMOTE_METADATA_FMT = "i" * fmt_length
     REMOTE_METADATA_BYTES = 4 * fmt_length
     logger.info(
@@ -98,13 +113,27 @@ def get_remote_metadata_bytes():
 
 @dataclass
 class RemoteMetadata:
+    """
+    Metadata for remote storage chunks.
+
+    Attributes:
+        length: Size of the data in bytes
+        shapes: List of tensor shapes
+        dtypes: List of tensor data types
+        fmt: Memory format (KV_2LTD or KV_MLA_FMT)
+        pd_role: Node type flag - "prefill" (0) or "decode" (1)
+                 Indicates which type of node saved this chunk.
+                 Default is "prefill".
+    """
+
     length: int
     shapes: list[torch.Size]
     dtypes: list[torch.dtype]
     fmt: MemoryFormat
+    pd_role: str = "prefill"  # Node type: "prefill" (P/0) or "decode" (D/1)
 
     def _prepare_params(self):
-        params = [self.length, int(self.fmt.value)]
+        params = [self.length, int(self.fmt.value), PD_ROLE_TO_INT[self.pd_role]]
         for shape, dtype in zip(self.shapes, self.dtypes, strict=True):
             assert len(shape) == 4, "Shape dimension should be 4"
             params.append(DTYPE_TO_INT[dtype])
@@ -128,13 +157,14 @@ class RemoteMetadata:
     @staticmethod
     def deserialize(s: bytes) -> "RemoteMetadata":
         assert REMOTE_METADATA_FMT is not None
-        # length, fmt, (dtype, shape0, shape1, shape2, shape3) * num_groups
+        # length, fmt, pd_role, (dtype, shape0, shape1, shape2, shape3) * num_groups
         result = struct.unpack_from(REMOTE_METADATA_FMT, s)
         length = result[0]
         memory_fmt = MemoryFormat(result[1])
+        pd_role = INT_TO_PD_ROLE[result[2]]
         shapes = []
         dtypes = []
-        for i in range(2, len(result), 5):
+        for i in range(3, len(result), 5):
             shapes.append(torch.Size(result[i + 1 : i + 5]))
             dtypes.append(INT_TO_DTYPE[result[i]])
 
@@ -143,6 +173,7 @@ class RemoteMetadata:
             shapes,
             dtypes,
             memory_fmt,
+            pd_role,
         )
 
 
