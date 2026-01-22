@@ -61,6 +61,8 @@ class LMCacheStats:
     # Real time value measurements (will be reset after each log)
     retrieve_hit_rate: float
     lookup_hit_rate: float
+    lookup_hit_rate_from_prefill: float
+    lookup_hit_rate_from_decode: float
 
     local_cache_usage_bytes: int  # Size of the used local cache in bytes
     remote_cache_usage_bytes: int  # Size of the used remote cache in bytes
@@ -109,6 +111,8 @@ class LookupRequestStats:
     is_finished: bool
     start_time: float = 0
     end_time: float = 0
+    hit_tokens_from_prefill: int = 0
+    hit_tokens_from_decode: int = 0
 
     def time_to_lookup(self):
         if self.end_time == 0:
@@ -362,6 +366,8 @@ class LMCStatsMonitor:
         # Track hits by node type
         self.interval_hit_tokens_from_prefill += hit_tokens_from_prefill
         self.interval_hit_tokens_from_decode += hit_tokens_from_decode
+        stats.hit_tokens_from_prefill = hit_tokens_from_prefill
+        stats.hit_tokens_from_decode = hit_tokens_from_decode
 
         if num_hit_tokens == 0:
             self.interval_lookup_0_hit_requests += 1
@@ -675,10 +681,27 @@ class LMCStatsMonitor:
         ]
         sum_finished_lookup_requested = sum(s.num_tokens for s in finished_lookup_stats)
         sum_finished_lookup_hit = sum(s.hit_tokens for s in finished_lookup_stats)
+        sum_finished_lookup_hit_from_prefill = sum(
+            s.hit_tokens_from_prefill for s in finished_lookup_stats
+        )
+        sum_finished_lookup_hit_from_decode = sum(
+            s.hit_tokens_from_decode for s in finished_lookup_stats
+        )
+
         lookup_hit_rate = (
             0
             if sum_finished_lookup_requested == 0
             else sum_finished_lookup_hit / sum_finished_lookup_requested
+        )
+        lookup_hit_rate_from_prefill = (
+            0
+            if sum_finished_lookup_hit == 0
+            else sum_finished_lookup_hit_from_prefill / sum_finished_lookup_hit
+        )
+        lookup_hit_rate_from_decode = (
+            0
+            if sum_finished_lookup_hit == 0
+            else sum_finished_lookup_hit_from_decode / sum_finished_lookup_hit
         )
 
         def filter_out_zeros(stats: List[float]):
@@ -782,6 +805,8 @@ class LMCStatsMonitor:
             interval_remote_ping_error_code=self.interval_remote_ping_error_code,
             retrieve_hit_rate=retrieve_hit_rate,
             lookup_hit_rate=lookup_hit_rate,
+            lookup_hit_rate_from_prefill=lookup_hit_rate_from_prefill,
+            lookup_hit_rate_from_decode=lookup_hit_rate_from_decode,
             interval_local_cpu_evict_count=self.interval_local_cpu_evict_count,
             interval_local_cpu_evict_keys_count=self.interval_local_cpu_evict_keys_count,
             interval_local_cpu_evict_failed_count=self.interval_local_cpu_evict_failed_count,
@@ -1004,6 +1029,20 @@ class PrometheusLogger:
         self.gauge_lookup_hit_rate = self._gauge_cls(
             name="lmcache:lookup_hit_rate",
             documentation="Hit rate of lmcache lookup requests since last log",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        )
+
+        self.gauge_lookup_hit_rate_from_prefill = self._gauge_cls(
+            name="lmcache:lookup_hit_rate_from_prefill",
+            documentation="Proportion of hit tokens from prefill nodes",
+            labelnames=labelnames,
+            multiprocess_mode="livemostrecent",
+        )
+
+        self.gauge_lookup_hit_rate_from_decode = self._gauge_cls(
+            name="lmcache:lookup_hit_rate_from_decode",
+            documentation="Proportion of hit tokens from decode nodes",
             labelnames=labelnames,
             multiprocess_mode="livemostrecent",
         )
@@ -1600,6 +1639,14 @@ class PrometheusLogger:
         self._log_gauge(self.gauge_retrieve_hit_rate, stats.retrieve_hit_rate)
 
         self._log_gauge(self.gauge_lookup_hit_rate, stats.lookup_hit_rate)
+
+        self._log_gauge(
+            self.gauge_lookup_hit_rate_from_prefill, stats.lookup_hit_rate_from_prefill
+        )
+
+        self._log_gauge(
+            self.gauge_lookup_hit_rate_from_decode, stats.lookup_hit_rate_from_decode
+        )
 
         self._log_gauge(self.gauge_local_cache_usage, stats.local_cache_usage_bytes)
 
