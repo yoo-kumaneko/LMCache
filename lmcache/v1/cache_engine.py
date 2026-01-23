@@ -197,12 +197,6 @@ class LMCacheEngine:
 
         InitializeUsageContext(config, metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
-        self.stats_monitor.retrieve_time_threshold = config.get_extra_config_value(
-            "retrieve_time_threshold", 5.0
-        )
-        self.stats_monitor.retrieve_speed_threshold = config.get_extra_config_value(
-            "retrieve_speed_threshold", 1024.0
-        )
 
         self.post_inited = False
 
