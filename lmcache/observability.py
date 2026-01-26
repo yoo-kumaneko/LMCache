@@ -82,6 +82,9 @@ class LMCacheStats:
     retrieve_to_gpu_time: List[float]
     remote_backend_batched_get_blocking_time: List[float]
     instrumented_connector_batched_get_time: List[float]
+    fs_connector_get_time: List[float]
+    nitrofs_connector_read_time: List[float]
+    instrumented_connector_get_time: List[float]
     store_process_tokens_time: List[float]
     store_from_gpu_time: List[float]
     store_put_time: List[float]
@@ -727,6 +730,31 @@ class LMCStatsMonitor:
             stats.detailed_metrics.get("instrumented_connector_batched_get_time", 0.0)
             for stats in self.retrieve_requests.values()
         )
+
+        fs_connector_get_time = []
+        nitrofs_connector_read_time = []
+        instrumented_connector_get_time = []
+        for stats in self.retrieve_requests.values():
+            individual_stats = stats.detailed_metrics.get(
+                "remote_backend_individual_get_stats", {}
+            )
+            for key_stats in individual_stats.values():
+                if "fs_connector_get_time" in key_stats:
+                    fs_connector_get_time.append(key_stats["fs_connector_get_time"])
+                if "nitrofs_connector_read_time" in key_stats:
+                    nitrofs_connector_read_time.append(
+                        key_stats["nitrofs_connector_read_time"]
+                    )
+                if "instrumented_connector_get_time" in key_stats:
+                    instrumented_connector_get_time.append(
+                        key_stats["instrumented_connector_get_time"]
+                    )
+        fs_connector_get_time = filter_out_zeros(fs_connector_get_time)
+        nitrofs_connector_read_time = filter_out_zeros(nitrofs_connector_read_time)
+        instrumented_connector_get_time = filter_out_zeros(
+            instrumented_connector_get_time
+        )
+
         store_process_tokens_time = filter_out_zeros(
             stats.process_tokens_time for stats in self.store_requests.values()
         )
@@ -794,6 +822,9 @@ class LMCStatsMonitor:
             retrieve_to_gpu_time=retrieve_to_gpu_time,
             remote_backend_batched_get_blocking_time=remote_backend_batched_get_blocking_time,  # noqa: E501
             instrumented_connector_batched_get_time=instrumented_connector_batched_get_time,  # noqa: E501
+            fs_connector_get_time=fs_connector_get_time,
+            nitrofs_connector_read_time=nitrofs_connector_read_time,
+            instrumented_connector_get_time=instrumented_connector_get_time,
             store_process_tokens_time=store_process_tokens_time,
             store_from_gpu_time=store_from_gpu_time,
             store_put_time=store_put_time,
@@ -1119,6 +1150,24 @@ class PrometheusLogger:
         self.histogram_instrumented_connector_batched_get_time = self._histogram_cls(
             name="lmcache:instrumented_connector_batched_get_time",
             documentation="Time used by the connector (seconds)",
+            labelnames=labelnames,
+            buckets=profiling_buckets,
+        )
+        self.histogram_fs_connector_get_time = self._histogram_cls(
+            name="lmcache:fs_connector_get_time",
+            documentation="Time to get from fs connector (seconds)",
+            labelnames=labelnames,
+            buckets=profiling_buckets,
+        )
+        self.histogram_nitrofs_connector_read_time = self._histogram_cls(
+            name="lmcache:nitrofs_connector_read_time",
+            documentation="Time to read from nitrofs connector (seconds)",
+            labelnames=labelnames,
+            buckets=profiling_buckets,
+        )
+        self.histogram_instrumented_connector_get_time = self._histogram_cls(
+            name="lmcache:instrumented_connector_get_time",
+            documentation="Time used by the instrumented connector (seconds)",
             labelnames=labelnames,
             buckets=profiling_buckets,
         )
@@ -1636,6 +1685,17 @@ class PrometheusLogger:
         self._log_histogram(
             self.histogram_instrumented_connector_batched_get_time,
             stats.instrumented_connector_batched_get_time,
+        )
+        self._log_histogram(
+            self.histogram_fs_connector_get_time, stats.fs_connector_get_time
+        )
+        self._log_histogram(
+            self.histogram_nitrofs_connector_read_time,
+            stats.nitrofs_connector_read_time,
+        )
+        self._log_histogram(
+            self.histogram_instrumented_connector_get_time,
+            stats.instrumented_connector_get_time,
         )
         self._log_histogram(
             self.histogram_store_process_tokens_time, stats.store_process_tokens_time

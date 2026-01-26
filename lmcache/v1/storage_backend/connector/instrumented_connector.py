@@ -54,9 +54,9 @@ class InstrumentedRemoteConnector(RemoteConnector):
             retrieve_stats is not None
             and "remote_backend_individual_get_stats" in retrieve_stats.detailed_metrics
         ):
-            retrieve_stats.detailed_metrics["remote_backend_individual_get_stats"][
-                key
-            ] = {"instrumented_connector_get_time": duration}
+            retrieve_stats.detailed_metrics[
+                "remote_backend_individual_get_stats"
+            ].setdefault(key, {})["instrumented_connector_get_time"] = duration
 
         if memory_obj is not None:
             obj_size = memory_obj.get_size()

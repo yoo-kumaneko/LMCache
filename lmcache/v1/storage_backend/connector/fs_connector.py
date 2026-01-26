@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, no_type_check
 import asyncio
 import os
+import time
 
 # Third Party
 import aiofiles
@@ -12,6 +13,7 @@ import xattr
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryObj
@@ -56,6 +58,7 @@ class FSConnector(RemoteConnector):
 
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
+        self._stats_monitor = LMCStatsMonitor.GetOrCreate()
 
         relative_tmp_dir = (
             None
@@ -197,83 +200,106 @@ class FSConnector(RemoteConnector):
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Get data from file system"""
         file_path = self._get_file_path(key)
-
-        if self.use_odirect and not self.save_chunk_meta:
-            return await self.loop.run_in_executor(
-                None, self._get_with_odirect, file_path
-            )
+        start_time = time.perf_counter()
 
         memory_obj = None
         try:
-            async with aiofiles.open(file_path, "rb") as f:
-                if self.save_chunk_meta:
-                    # Read metadata buffer first to get shape, dtype, fmt
-                    # to be able to allocate memory object for the data and read into it
-                    md_buffer = bytearray(self.remote_metadata_bytes)
-                    num_read = await f.readinto(md_buffer)
-                    if num_read != len(md_buffer):
-                        raise RuntimeError(
-                            f"Partial read meta {len(md_buffer)} got {num_read}"
-                        )
-
-                    # Deserialize metadata and allocate memory
-                    metadata = RemoteMetadata.deserialize(md_buffer)
-                    memory_obj = self.local_cpu_backend.allocate(
-                        metadata.shapes, metadata.dtypes, metadata.fmt
-                    )
-                else:
-                    memory_obj = self.local_cpu_backend.allocate(
-                        self.meta_shapes, self.meta_dtypes, self.meta_fmt
-                    )
-                if memory_obj is None:
-                    logger.debug("Memory allocation failed during async disk load.")
-                    return None
-
-                # Read the actual data into allocated memory
-                buffer = memory_obj.byte_array
-                if self.save_chunk_meta:
-                    # if save chunk meta, read meta will trigger
-                    # read ahead if fs supported
-                    num_read = await f.readinto(buffer)
-                    if num_read != len(buffer):
-                        raise RuntimeError(
-                            f"Partial read data {len(buffer)} got {num_read}"
-                        )
-                else:
-                    if self.read_ahead_size is None:
-                        num_read = await f.readinto(buffer)
-                    else:
-                        if not isinstance(buffer, memoryview):
-                            buffer = memoryview(buffer)
-
-                        # trigger read head if fs supported
-                        num_read_ahead = await f.readinto(
-                            buffer[: self.read_ahead_size]
-                        )
-                        assert num_read_ahead <= self.read_ahead_size
-
-                        # if num_read_ahead == self.read_ahead_size,
-                        # means there may still be some remaining content
-                        if num_read_ahead == self.read_ahead_size:
-                            num_read_tail = await f.readinto(
-                                buffer[self.read_ahead_size :]
+            if self.use_odirect and not self.save_chunk_meta:
+                memory_obj = await self.loop.run_in_executor(
+                    None, self._get_with_odirect, file_path
+                )
+            else:
+                async with aiofiles.open(file_path, "rb") as f:
+                    if self.save_chunk_meta:
+                        # Read metadata buffer first to get shape, dtype, fmt
+                        # to allocate memory object for the data and read into it
+                        md_buffer = bytearray(self.remote_metadata_bytes)
+                        num_read = await f.readinto(md_buffer)
+                        if num_read != len(md_buffer):
+                            raise RuntimeError(
+                                f"Partial read meta {len(md_buffer)} got {num_read}"
                             )
-                            assert num_read_tail is not None
-                            num_read = num_read_ahead + num_read_tail
-                        else:
-                            num_read = num_read_ahead
-                    # reshape and check
-                    assert num_read is not None
-                    memory_obj = self.reshape_partial_chunk(memory_obj, num_read)
 
-            return memory_obj
+                        # Deserialize metadata and allocate memory
+                        metadata = RemoteMetadata.deserialize(md_buffer)
+                        memory_obj = self.local_cpu_backend.allocate(
+                            metadata.shapes, metadata.dtypes, metadata.fmt
+                        )
+                    else:
+                        memory_obj = self.local_cpu_backend.allocate(
+                            self.meta_shapes, self.meta_dtypes, self.meta_fmt
+                        )
+                    if memory_obj is None:
+                        logger.debug("Memory allocation failed during async disk load.")
+                    else:
+                        # Read the actual data into allocated memory
+                        buffer = memory_obj.byte_array
+                        if self.save_chunk_meta:
+                            # if save chunk meta, read meta will trigger
+                            # read ahead if fs supported
+                            num_read = await f.readinto(buffer)
+                            if num_read != len(buffer):
+                                raise RuntimeError(
+                                    f"Partial read data {len(buffer)} got {num_read}"
+                                )
+                        else:
+                            if self.read_ahead_size is None:
+                                num_read = await f.readinto(buffer)
+                            else:
+                                if not isinstance(buffer, memoryview):
+                                    buffer = memoryview(buffer)
+
+                                # trigger read head if fs supported
+                                num_read_ahead = await f.readinto(
+                                    buffer[: self.read_ahead_size]
+                                )
+                                assert num_read_ahead <= self.read_ahead_size
+
+                                # if num_read_ahead == self.read_ahead_size,
+                                # means there may still be some remaining content
+                                if num_read_ahead == self.read_ahead_size:
+                                    num_read_tail = await f.readinto(
+                                        buffer[self.read_ahead_size :]
+                                    )
+                                    assert num_read_tail is not None
+                                    num_read = num_read_ahead + num_read_tail
+                                else:
+                                    num_read = num_read_ahead
+                            # reshape and check
+                            assert num_read is not None
+                            memory_obj = self.reshape_partial_chunk(
+                                memory_obj, num_read
+                            )
 
         except Exception as e:
             if not isinstance(e, FileNotFoundError):
                 logger.error(f"Failed to read from file {file_path}: {str(e)}")
             if memory_obj is not None:
                 memory_obj.ref_count_down()
-            return None
+            memory_obj = None
+
+        duration = time.perf_counter() - start_time
+
+        # Record stats
+        retrieve_stats = self._stats_monitor.get_current_retrieve_stats()
+        if (
+            retrieve_stats is not None
+            and "remote_backend_individual_get_stats" in retrieve_stats.detailed_metrics
+        ):
+            retrieve_stats.detailed_metrics[
+                "remote_backend_individual_get_stats"
+            ].setdefault(key, {})["fs_connector_get_time"] = duration
+
+        if memory_obj is not None:
+            obj_size = memory_obj.get_size()
+            logger.debug(
+                "[%s]Bytes loaded: %.3f MBytes in %.3f ms",
+                self.__class__.__name__,
+                obj_size / 1e6,
+                duration * 1000,
+            )
+
+        return memory_obj
 
     def _put_with_odirect(self, file_path: Path, buffer: bytes) -> None:
         fd = -1
