@@ -37,6 +37,7 @@ class LMCacheStats:
 
     interval_num_slow_retrieval_by_time: int
     interval_num_slow_retrieval_by_speed: int
+    interval_unsuccessful_retrieve_requests: int
 
     interval_remote_read_requests: int
     interval_remote_read_bytes: int
@@ -254,6 +255,7 @@ class LMCStatsMonitor:
 
         self.interval_num_slow_retrieval_by_time = 0
         self.interval_num_slow_retrieval_by_speed = 0
+        self.interval_unsuccessful_retrieve_requests = 0
 
         # P2P transfer metrics
         self.interval_p2p_requests = 0
@@ -404,6 +406,13 @@ class LMCStatsMonitor:
             self.interval_num_slow_retrieval_by_time += 1
         if 0 < retrieve_speed < self.retrieve_token_speed_threshold:
             self.interval_num_slow_retrieval_by_speed += 1
+
+        if (
+            retrieve_stats.num_tokens > 0
+            and (retrieve_stats.local_hit_tokens + retrieve_stats.remote_hit_tokens)
+            < retrieve_stats.num_tokens
+        ):
+            self.interval_unsuccessful_retrieve_requests += 1
 
         # Log a warning if the retrieval performance is below defined thresholds:
         # 1. Total time taken (time_to_retrieve) exceeds the maximum allowed time.
@@ -598,6 +607,7 @@ class LMCStatsMonitor:
 
         self.interval_num_slow_retrieval_by_time = 0
         self.interval_num_slow_retrieval_by_speed = 0
+        self.interval_unsuccessful_retrieve_requests = 0
 
         self.interval_remote_read_requests = 0
         self.interval_remote_read_bytes = 0
@@ -832,6 +842,7 @@ class LMCStatsMonitor:
             interval_p2p_requests=self.interval_p2p_requests,
             interval_num_slow_retrieval_by_time=self.interval_num_slow_retrieval_by_time,
             interval_num_slow_retrieval_by_speed=self.interval_num_slow_retrieval_by_speed,
+            interval_unsuccessful_retrieve_requests=self.interval_unsuccessful_retrieve_requests,
             interval_p2p_transferred_tokens=self.interval_p2p_transferred_tokens,
             p2p_time_to_transfer=p2p_time_to_transfer,
             p2p_transfer_speed=p2p_transfer_speed,
@@ -1010,6 +1021,12 @@ class PrometheusLogger:
         self.counter_num_slow_retrieval_by_speed = self._counter_cls(
             name="lmcache:num_slow_retrieval_by_speed",
             documentation="Total number of slow retrievals by speed threshold",
+            labelnames=labelnames,
+        )
+
+        self.counter_num_unsuccessful_retrieve_requests = self._counter_cls(
+            name="lmcache:num_unsuccessful_retrieve_requests",
+            documentation="Total number of unsuccessful retrieve requests",
             labelnames=labelnames,
         )
 
@@ -1646,6 +1663,10 @@ class PrometheusLogger:
         self._log_counter(
             self.counter_num_slow_retrieval_by_speed,
             stats.interval_num_slow_retrieval_by_speed,
+        )
+        self._log_counter(
+            self.counter_num_unsuccessful_retrieve_requests,
+            stats.interval_unsuccessful_retrieve_requests,
         )
 
         self._log_gauge(self.gauge_retrieve_hit_rate, stats.retrieve_hit_rate)
