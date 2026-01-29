@@ -1080,22 +1080,16 @@ class PrometheusLogger:
         )
 
         time_to_retrieve_buckets = [
-            0.001,
-            0.005,
-            0.01,
-            0.02,
-            0.04,
-            0.06,
-            0.08,
-            0.1,
-            0.25,
-            0.5,
-            0.75,
-            1.0,
-            2.5,
-            5.0,
-            7.5,
-            10.0,
+            0.1,  # 100 ms
+            0.2,  # 200 ms
+            0.4,  # 400 ms
+            0.6,  # 600 ms
+            0.8,  # 800 ms
+            1.0,  # 1 s
+            2.0,  # 2 s
+            4.0,  # 4 s
+            6.0,  # 6 s
+            10.0,  # 10 s
         ]
         self.histogram_time_to_retrieve = self._histogram_cls(
             name="lmcache:time_to_retrieve",
@@ -1105,22 +1099,16 @@ class PrometheusLogger:
         )
 
         time_to_store_buckets = [
-            0.001,
-            0.005,
-            0.01,
-            0.02,
-            0.04,
-            0.06,
-            0.08,
-            0.1,
-            0.25,
-            0.5,
-            0.75,
-            1.0,
-            2.5,
-            5.0,
-            7.5,
-            10.0,
+            0.001,  # 1 ms
+            0.002,  # 2 ms
+            0.005,  # 5 ms
+            0.01,  # 10 ms
+            0.02,  # 20 ms
+            0.05,  # 50 ms
+            0.1,  # 100 ms
+            0.2,  # 200 ms
+            0.5,  # 500 ms
+            1.0,  # 1 s
         ]
         self.histogram_time_to_store = self._histogram_cls(
             name="lmcache:time_to_store",
@@ -1129,9 +1117,18 @@ class PrometheusLogger:
             buckets=time_to_store_buckets,
         )
 
-        time_to_lookup_buckets = [
-            0.00001 * 2**i for i in range(20)
-        ]  # 0.01 ms to 5000 ms
+        time_to_lookup_buckets = [  # same as time_to_store
+            0.001,  # 1 ms
+            0.002,  # 2 ms
+            0.005,  # 5 ms
+            0.01,  # 10 ms
+            0.02,  # 20 ms
+            0.05,  # 50 ms
+            0.1,  # 100 ms
+            0.2,  # 200 ms
+            0.5,  # 500 ms
+            1.0,  # 1 s
+        ]
         self.histogram_time_to_lookup = self._histogram_cls(
             name="lmcache:time_to_lookup",
             documentation="Time to lookup in lmcache (seconds)",
@@ -1139,81 +1136,98 @@ class PrometheusLogger:
             buckets=time_to_lookup_buckets,
         )
 
-        profiling_buckets = [0.00001 * 2**i for i in range(20)]  # 0.01 ms to 5000 ms
+        short_profiling_buckets = [
+            0.001,  # 1 ms
+            0.005,  # 5 ms
+            0.01,  # 10 ms
+            0.02,  # 20 ms
+            0.05,  # 50 ms
+            0.1,  # 100 ms
+            0.2,  # 200 ms
+            0.5,  # 500 ms
+            1.0,  # 1 s
+            2.0,  # 2 s
+        ]
+        long_profiling_buckets = [
+            0.1,  # 100 ms
+            0.2,  # 200 ms
+            0.4,  # 400 ms
+            0.6,  # 600 ms
+            0.8,  # 800 ms
+            1.0,  # 1 s
+            2.0,  # 2 s
+            3.0,  # 3 s
+            5.0,  # 5 s
+            10.0,  # 10 s
+        ]
         self.histogram_retrieve_process_tokens_time = self._histogram_cls(
             name="lmcache:retrieve_process_tokens_time",
             documentation="Time to process tokens in retrieve (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=long_profiling_buckets,
         )
         self.histogram_retrieve_broadcast_time = self._histogram_cls(
             name="lmcache:retrieve_broadcast_time",
             documentation="Time to broadcast memory objects in retrieve (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=short_profiling_buckets,
         )
         self.histogram_retrieve_to_gpu_time = self._histogram_cls(
             name="lmcache:retrieve_to_gpu_time",
             documentation="Time to move data to GPU in retrieve (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=short_profiling_buckets,
         )
         self.histogram_remote_backend_batched_get_blocking_time = self._histogram_cls(
             name="lmcache:remote_backend_batched_get_blocking_time",
             documentation="Time to get data from remote backend (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=long_profiling_buckets,
         )
         self.histogram_instrumented_connector_batched_get_time = self._histogram_cls(
             name="lmcache:instrumented_connector_batched_get_time",
             documentation="Time used by the connector (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=long_profiling_buckets,
         )
         self.histogram_fs_connector_get_time = self._histogram_cls(
             name="lmcache:fs_connector_get_time",
             documentation="Time to get from fs connector (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=short_profiling_buckets,
         )
         self.histogram_nitrofs_connector_read_time = self._histogram_cls(
             name="lmcache:nitrofs_connector_read_time",
             documentation="Time to read from nitrofs connector (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=short_profiling_buckets,
         )
         self.histogram_instrumented_connector_get_time = self._histogram_cls(
             name="lmcache:instrumented_connector_get_time",
             documentation="Time used by the instrumented connector (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=short_profiling_buckets,
         )
         self.histogram_store_process_tokens_time = self._histogram_cls(
             name="lmcache:store_process_tokens_time",
             documentation="Time to process tokens in store (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=short_profiling_buckets,
         )
         self.histogram_store_from_gpu_time = self._histogram_cls(
             name="lmcache:store_from_gpu_time",
             documentation="Time to move data from GPU in store (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=short_profiling_buckets,
         )
         self.histogram_store_put_time = self._histogram_cls(
             name="lmcache:store_put_time",
             documentation="Time to put data to storage in store (seconds)",
             labelnames=labelnames,
-            buckets=profiling_buckets,
+            buckets=short_profiling_buckets,
         )
 
         retrieve_speed_buckets = [
-            1,
-            8,
-            16,
-            32,
-            64,
-            128,
             256,
             512,
             1024,
@@ -1221,6 +1235,7 @@ class PrometheusLogger:
             4096,
             8192,
             16384,
+            24576,
             32768,
             65536,
         ]
@@ -1232,12 +1247,6 @@ class PrometheusLogger:
         )
 
         store_speed_buckets = [
-            1,
-            8,
-            16,
-            32,
-            64,
-            128,
             256,
             512,
             1024,
@@ -1245,6 +1254,7 @@ class PrometheusLogger:
             4096,
             8192,
             16384,
+            24576,
             32768,
             65536,
         ]
@@ -1258,20 +1268,14 @@ class PrometheusLogger:
         # P2P transfer metrics
         p2p_time_buckets = [
             0.001,  # 1ms
-            0.005,  # 5ms
             0.01,  # 10ms
-            0.02,  # 20ms
-            0.04,  # 40ms
-            0.06,  # 60ms
-            0.08,  # 80ms
+            0.05,  # 50ms
             0.1,  # 100ms
             0.25,  # 250ms
             0.5,  # 500ms
-            0.75,  # 750ms
             1.0,  # 1s
             2.5,  # 2.5s
             5.0,  # 5s
-            7.5,  # 7.5s
             10.0,  # 10s
         ]
         self.histogram_p2p_time_to_transfer = self._histogram_cls(
@@ -1283,11 +1287,7 @@ class PrometheusLogger:
 
         p2p_speed_buckets = [
             1,
-            8,
-            16,
-            32,
             64,
-            128,
             256,
             512,
             1024,
@@ -1295,7 +1295,6 @@ class PrometheusLogger:
             4096,
             8192,
             16384,
-            32768,
             65536,
         ]
         self.histogram_p2p_transfer_speed = self._histogram_cls(
@@ -1307,20 +1306,14 @@ class PrometheusLogger:
 
         remote_time_to_get = [
             1,
-            5,
             10,
-            20,
             40,
-            60,
-            80,
             100,
             250,
             500,
-            750,
             1000,
             2500,
             5000,
-            7500,
             10000,
         ]
         self.histogram_remote_time_to_get = self._histogram_cls(
@@ -1332,20 +1325,14 @@ class PrometheusLogger:
 
         remote_time_to_put = [
             1,
-            5,
             10,
-            20,
             40,
-            60,
-            80,
             100,
             250,
             500,
-            750,
             1000,
             2500,
             5000,
-            7500,
             10000,
         ]
         self.histogram_remote_time_to_put = self._histogram_cls(
@@ -1357,20 +1344,14 @@ class PrometheusLogger:
 
         remote_time_to_get_sync = [
             1,
-            5,
             10,
-            20,
             40,
-            60,
-            80,
             100,
             250,
             500,
-            750,
             1000,
             2500,
             5000,
-            7500,
             10000,
         ]
         self.histogram_remote_time_to_get_sync = self._histogram_cls(
@@ -1401,19 +1382,14 @@ class PrometheusLogger:
 
         request_cache_lifespan_buckets = [
             0,
-            1,
-            5,
             10,
-            20,
-            40,
-            60,
-            80,
+            50,
             100,
             250,
             500,
-            750,
             1000,
-            2500,
+            2000,
+            3000,
             5000,
         ]
         self.histogram_request_cache_lifespan = self._histogram_cls(
