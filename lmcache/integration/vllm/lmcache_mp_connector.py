@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
+import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import zmq
@@ -40,7 +41,6 @@ except ImportError:
     )
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
         KVConnectorPromMetrics,
@@ -55,6 +55,12 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+
+def _adapter_accepts_tp_size() -> bool:
+    """Check if the imported adapter accepts tp_size."""
+    sig = inspect.signature(LMCacheMPSchedulerAdapter.__init__)
+    return "tp_size" in sig.parameters
 
 
 # Helper functions
@@ -106,6 +112,14 @@ def create_scheduler_adapter(
         vllm_config.parallel_config.rank,
         vllm_config,
     )
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+
+    # Pass tp_size only when the adapter accepts it so that
+    # a newer vllm can still work with an older LMCache.
+    kwargs: dict[str, Any] = {}
+    if _adapter_accepts_tp_size():
+        kwargs["tp_size"] = tp_size
+
     return LMCacheMPSchedulerAdapter(
         server_url,
         zmq_context,
@@ -113,6 +127,7 @@ def create_scheduler_adapter(
         world_size,
         kv_rank,
         vllm_config.cache_config.block_size,
+        **kwargs,
     )
 
 
@@ -128,6 +143,12 @@ def create_polling_scheduler_adapter(
         vllm_config.parallel_config.rank,
         vllm_config,
     )
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+
+    kwargs: dict[str, Any] = {}
+    if _adapter_accepts_tp_size():
+        kwargs["tp_size"] = tp_size
+
     return LMCacheMPPollingSchedulerAdapter(
         server_url,
         zmq_context,
@@ -135,6 +156,7 @@ def create_polling_scheduler_adapter(
         world_size,
         kv_rank,
         vllm_config.cache_config.block_size,
+        **kwargs,
     )
 
 
@@ -149,6 +171,12 @@ def create_sync_scheduler_adapter(
         vllm_config.parallel_config.rank,
         vllm_config,
     )
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+
+    kwargs: dict[str, Any] = {}
+    if _adapter_accepts_tp_size():
+        kwargs["tp_size"] = tp_size
+
     return LMCacheMPSyncSchedulerAdapter(
         server_url,
         zmq_context,
@@ -156,6 +184,7 @@ def create_sync_scheduler_adapter(
         world_size,
         kv_rank,
         vllm_config.cache_config.block_size,
+        **kwargs,
     )
 
 
@@ -441,7 +470,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         self,
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
-        kv_cache_config: Optional["KVCacheConfig"] = None,
+        kv_cache_config: "KVCacheConfig | None" = None,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
 
@@ -668,7 +697,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             self.worker_adapter.shutdown()
         return None
 
-    def get_kv_connector_stats(self) -> Optional["KVConnectorStats"]:
+    def get_kv_connector_stats(self) -> "KVConnectorStats | None":
         """
         Get the KV connector stats collected during the last interval.
         """
@@ -887,7 +916,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
     @classmethod
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None
-    ) -> Optional["KVConnectorStats"]:
+    ) -> "KVConnectorStats | None":
         """
         KVConnectorStats resolution method. This method allows dynamically
         registered connectors to return their own KVConnectorStats object,
@@ -902,7 +931,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         metric_types: dict[type["PromMetric"], type["PromMetricT"]],
         labelnames: list[str],
         per_engine_labelvalues: dict[int, list[object]],
-    ) -> Optional["KVConnectorPromMetrics"]:
+    ) -> "KVConnectorPromMetrics | None":
         """
         Create a KVConnectorPromMetrics subclass which should register
         per-connector Prometheus metrics and implement observe() to
