@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import enum
 import inspect
+import time
 
 # Third Party
 from vllm.config import VllmConfig
@@ -794,12 +795,28 @@ class LMCacheMPConnectorDynamic(KVConnectorBase_V1):
         if request.status == RequestStatus.PREEMPTED:
             return 0, False
 
+        _t0 = time.monotonic()
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
             token_ids=list(request.all_token_ids),
         )
+        _t1 = time.monotonic()
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
+        _t2 = time.monotonic()
+
+        logger.debug(
+            "GET_MATCHED_TOKENS req=%s: "
+            "maybe_submit_lookup=%.3f ms, "
+            "check_lookup_result=%.3f ms, "
+            "total=%.3f ms, ret=%s",
+            request.request_id,
+            (_t1 - _t0) * 1000,
+            (_t2 - _t1) * 1000,
+            (_t2 - _t0) * 1000,
+            ret,
+        )
+
         if ret is None:
             return None, True
 

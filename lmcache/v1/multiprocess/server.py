@@ -777,18 +777,40 @@ class MPCacheEngine:
             )
         )
 
-        # Save state for the RETRIEVE or FREE_LOOKUP_LOCKS that follows
-        with self._pending_lookups_lock:
-            self._pending_lookups[key.request_id] = _PendingLookupState(
-                remaining_keys=remaining_keys,
-                l2_lookup_results=l2_lookup_results,
-                layout_desc=layout_desc,
-                extra_count=extra_count,
-                world_size=key.world_size,
-                workers_remaining=key.world_size,
-            )
-
         found_count = hit_count // key.world_size
+
+        # Only save pending state if there are actual hits that RETRIEVE
+        # will need.  When hit_count is 0 there is nothing to load and
+        # no L2 pins worth keeping — release them immediately.
+        if found_count > 0:
+            with self._pending_lookups_lock:
+                self._pending_lookups[key.request_id] = _PendingLookupState(
+                    remaining_keys=remaining_keys,
+                    l2_lookup_results=l2_lookup_results,
+                    layout_desc=layout_desc,
+                    extra_count=extra_count,
+                    world_size=key.world_size,
+                    workers_remaining=key.world_size,
+                )
+        else:
+            # No hits — release any L2 pins acquired during lookup
+            if l2_lookup_results and remaining_keys:
+                self.storage_manager.unlock_l2_lookups(
+                    remaining_keys,
+                    l2_lookup_results,
+                )
+
+        logger.info(
+            "SYNC_LOOKUP[%s]: hit_count=%d, found_count=%d, "
+            "remaining_keys=%d, has_l2_results=%s, world_size=%d, saved_pending=%s",
+            key.request_id,
+            hit_count,
+            found_count,
+            len(remaining_keys),
+            l2_lookup_results is not None and bool(l2_lookup_results),
+            key.world_size,
+            found_count > 0,
+        )
 
         log_telemetry(
             make_end_event(
