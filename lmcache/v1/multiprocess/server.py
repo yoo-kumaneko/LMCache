@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from dataclasses import dataclass, field
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import argparse
 import threading
 import time
@@ -145,32 +146,22 @@ class _PrefetchJob:
 
 @dataclass
 class _PendingLookupState:
-    """State saved between SYNC_LOOKUP and RETRIEVE for L2 prefetch."""
+    """State saved between SYNC_LOOKUP and RETRIEVE for L2 prefetch.
 
-    remaining_keys: list[ObjectKey]
-    """Keys not found in L1 at lookup time (candidates for L2 load)."""
-
-    l2_lookup_results: dict[int, Bitmap] | None
-    """Per-adapter bitmaps of L2 hits (and pinned objects), or None."""
-
-    layout_desc: MemoryLayoutDesc
-    """Memory layout needed by the L2-to-L1 load phase."""
-
-    extra_count: int
-    """MLA extra reader count."""
+    SYNC_LOOKUP kicks off the L2-to-L1 transfer asynchronously via a
+    thread pool and stores the resulting Future here.  All TP workers
+    in RETRIEVE (or FREE_LOOKUP_LOCKS) simply wait on that future.
+    """
 
     world_size: int
-    """World size for normalizing hit counts."""
+    """World size (used for worker countdown)."""
 
-    # -- Coordination fields for multi-worker RETRIEVE ----------------------
-    load_done: threading.Event = field(default_factory=threading.Event)
-    """Signaled after the first RETRIEVE worker finishes L2-to-L1 load."""
+    workers_remaining: int
+    """Countdown of RETRIEVE/FREE workers; last one removes the entry."""
 
-    load_claimed: bool = False
-    """True once one RETRIEVE worker has claimed the L2 load work."""
-
-    workers_remaining: int = 0
-    """Countdown of RETRIEVE workers; last one removes the entry."""
+    prefetch_future: Future | None = None
+    """Future for the async L2-to-L1 load kicked off by sync_lookup.
+    None when there are no L2 results to load."""
 
 
 # Main class for the mp cache engine
@@ -217,6 +208,13 @@ class MPCacheEngine:
         # retrieve() or free_lookup_locks().
         self._pending_lookups: dict[str, _PendingLookupState] = {}
         self._pending_lookups_lock = threading.Lock()
+
+        # Thread pool for async L2-to-L1 prefetch tasks submitted by
+        # sync_lookup().  Separate from the MQ server's shared pool so
+        # that prefetch I/O doesn't starve request handlers.
+        self._prefetch_pool = ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="prefetch-pool"
+        )
 
         # FIX: fix the problem of telemetry logging in cupy stream
         # Need to log a retrieve operation before logging any store
@@ -434,32 +432,18 @@ class MPCacheEngine:
         )
         gpu_context = self.gpu_contexts[instance_id]
 
-        # If a prior SYNC_LOOKUP left pending L2 state, coordinate the
-        # L2-to-L1 load across TP workers: the first arrival does the work,
-        # the rest wait for it to finish.
+        # If a prior SYNC_LOOKUP left pending L2 state, wait for the
+        # async prefetch to complete before reading from L1.
         with self._pending_lookups_lock:
             pending = self._pending_lookups.get(key.request_id)
-            if pending is not None:
-                i_should_load = not pending.load_claimed
-                if i_should_load:
-                    pending.load_claimed = True
 
-        if pending is not None and pending.l2_lookup_results and pending.remaining_keys:
-            if i_should_load:
-                l2_loaded = self.storage_manager.execute_prefetch_load(
-                    pending.remaining_keys,
-                    pending.layout_desc,
-                    pending.l2_lookup_results,
-                    extra_count=pending.extra_count,
+        if pending is not None and pending.prefetch_future is not None:
+            try:
+                pending.prefetch_future.result()  # blocks until L2→L1 done
+            except Exception as e:
+                logger.warning(
+                    "Prefetch for %s failed in retrieve: %s", key.request_id, e
                 )
-                logger.debug(
-                    "RETRIEVE for %s: loaded %d L2 prefix hits into L1",
-                    key.request_id,
-                    l2_loaded,
-                )
-                pending.load_done.set()
-            else:
-                pending.load_done.wait()
 
         # Last worker removes the entry
         if pending is not None:
@@ -728,6 +712,40 @@ class MPCacheEngine:
 
         return found_count
 
+    def _run_prefetch_load(
+        self,
+        request_id: str,
+        remaining_keys: list[ObjectKey],
+        layout_desc: MemoryLayoutDesc,
+        l2_lookup_results: dict[int, Bitmap],
+        extra_count: int,
+    ) -> int:
+        """Run L2-to-L1 prefetch load; called from _prefetch_pool.
+
+        On success returns the number of chunks loaded.  On failure
+        releases L2 pins and re-raises so the Future carries the error.
+        """
+        try:
+            st = time.perf_counter()
+            loaded = self.storage_manager.execute_prefetch_load(
+                remaining_keys,
+                layout_desc,
+                l2_lookup_results,
+                extra_count=extra_count,
+            )
+            elapsed = time.perf_counter() - st
+            logger.info(
+                "Prefetch for %s: loaded %d L2 prefix hits into L1 in %.3f s",
+                request_id,
+                loaded,
+                elapsed,
+            )
+            return loaded
+        except Exception:
+            # On failure, release the L2 pins so they don't leak
+            self.storage_manager.unlock_l2_lookups(remaining_keys, l2_lookup_results)
+            raise
+
     @_lmcache_nvtx_annotate
     def sync_lookup(
         self,
@@ -736,10 +754,10 @@ class MPCacheEngine:
     ) -> int:
         """Synchronous prefix lookup — returns hit count directly.
 
-        Blocks until both L1 and L2 existence checks complete.  Does
-        **not** perform L2-to-L1 data movement; that happens later in
-        :meth:`retrieve`.  L2 objects found during lookup are pinned to
-        prevent eviction.
+        Blocks until both L1 and L2 existence checks complete.  When L2
+        hits are found, kicks off L2-to-L1 data transfer asynchronously
+        on the prefetch thread pool (overlapping with vLLM scheduling).
+        RETRIEVE workers wait on the resulting Future before reading L1.
 
         Args:
             key: Cache key with request_id embedded.
@@ -783,14 +801,24 @@ class MPCacheEngine:
         # will need.  When hit_count is 0 there is nothing to load and
         # no L2 pins worth keeping — release them immediately.
         if found_count > 0:
+            # Kick off L2-to-L1 transfer asynchronously so that it
+            # overlaps with vLLM scheduling before RETRIEVE arrives.
+            prefetch_future: Future | None = None
+            if l2_lookup_results and remaining_keys:
+                prefetch_future = self._prefetch_pool.submit(
+                    self._run_prefetch_load,
+                    key.request_id,
+                    remaining_keys,
+                    layout_desc,
+                    l2_lookup_results,
+                    extra_count,
+                )
+
             with self._pending_lookups_lock:
                 self._pending_lookups[key.request_id] = _PendingLookupState(
-                    remaining_keys=remaining_keys,
-                    l2_lookup_results=l2_lookup_results,
-                    layout_desc=layout_desc,
-                    extra_count=extra_count,
                     world_size=key.world_size,
                     workers_remaining=key.world_size,
+                    prefetch_future=prefetch_future,
                 )
         else:
             # No hits — release any L2 pins acquired during lookup
@@ -847,29 +875,17 @@ class MPCacheEngine:
                 multi-reader locking.
         """
         # Release any pending L2 pins from SYNC_LOOKUP.
-        # Coordinate with other TP workers: only unlock if nobody has
-        # claimed the load yet (i.e. all workers are freeing, not retrieving).
-        # If a load is already in progress, just wait for it and let the
-        # retrieve path handle cleanup.
-
-        # FIXME(rigginschen): Need to double check the compatibility
-        # with Non-MLA models, i.e. GQA models.
+        # If a prefetch was kicked off, wait for it to finish (it handles
+        # its own cleanup on success).  If it failed, pins were already
+        # released in _run_prefetch_load's except block.
         with self._pending_lookups_lock:
             pending = self._pending_lookups.get(key.request_id)
-            if pending is not None:
-                i_should_unlock = not pending.load_claimed
-                if i_should_unlock:
-                    pending.load_claimed = True
 
-        if pending is not None and pending.l2_lookup_results:
-            if i_should_unlock:
-                self.storage_manager.unlock_l2_lookups(
-                    pending.remaining_keys,
-                    pending.l2_lookup_results,
-                )
-                pending.load_done.set()
-            else:
-                pending.load_done.wait()
+        if pending is not None and pending.prefetch_future is not None:
+            try:
+                pending.prefetch_future.result()
+            except Exception:
+                pass  # pins already released on failure
 
         if pending is not None:
             with self._pending_lookups_lock:
@@ -954,6 +970,10 @@ class MPCacheEngine:
         """
         # Close storage manager
         self.storage_manager.close()
+
+        # Shut down the prefetch thread pool
+        self._prefetch_pool.shutdown(wait=False)
+
         logger.info("MPCacheEngine closed")
 
         # Release GPU contexts
