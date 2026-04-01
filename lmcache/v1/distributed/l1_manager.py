@@ -436,9 +436,20 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
             return ret
 
-        err, allocated_objs = self._memory_manager.allocate(
-            layout_desc, len(need_to_allocate)
-        )
+        # Choose allocation method based on ABO mode
+        if self._memory_manager._is_abo_enabled:
+            # is_temporary=True means L2→L1 load path, no compress needed
+            # is_temporary=False means STORE path (GPU→CPU), compress needed
+            need_compresses = [not is_temp for _, is_temp in need_to_allocate]
+            err, allocated_objs = self._memory_manager.allocate_compressed(
+                layout_desc,
+                len(need_to_allocate),
+                need_compresses=need_compresses,
+            )
+        else:
+            err, allocated_objs = self._memory_manager.allocate(
+                layout_desc, len(need_to_allocate)
+            )
 
         if err != L1Error.SUCCESS:
             for key, _ in need_to_allocate:
@@ -529,6 +540,65 @@ class L1Manager:
                 metadata={"keys": successful_keys},
             )
         )
+        return ret
+
+    @l1_mgr_synchronized
+    def abort_write(
+        self,
+        keys: list[ObjectKey],
+    ) -> dict[ObjectKey, L1Error]:
+        """Abort a write operation: unlock write lock, remove key, and free memory.
+
+        Used when an async operation (e.g. ABO compress) fails after
+        reserve_write but before finish_write. The key is removed from
+        L1 entirely so it does not occupy memory with invalid data.
+
+        Args:
+            keys: The list of object keys to abort.
+
+        Returns:
+            A dictionary mapping each object key to an L1Error.
+
+        Errors:
+            KEY_NOT_EXIST: The key does not exist.
+            KEY_IN_WRONG_STATE: The key is not write-locked.
+        """
+        need_to_free: list[MemoryObj] = []
+        ret: dict[ObjectKey, L1Error] = {}
+        aborted_keys: list[ObjectKey] = []
+
+        for key in keys:
+            entry = self._objects.get(key, None)
+            if entry is None:
+                ret[key] = L1Error.KEY_NOT_EXIST
+                continue
+
+            if not entry.write_lock.is_locked():
+                logger.warning(
+                    "L1Manager: abort_write on non-write-locked key %s",
+                    key,
+                )
+                ret[key] = L1Error.KEY_IN_WRONG_STATE
+                continue
+
+            # Unlock write lock, then remove and free
+            entry.write_lock.unlock()
+            need_to_free.append(entry.memory_obj)
+            del self._objects[key]
+            ret[key] = L1Error.SUCCESS
+            aborted_keys.append(key)
+
+        self._memory_manager.free(need_to_free)
+
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_deleted_by_manager(aborted_keys)
+
+        if aborted_keys:
+            logger.info(
+                "L1Manager: aborted write for %d keys",
+                len(aborted_keys),
+            )
+
         return ret
 
     @l1_mgr_synchronized

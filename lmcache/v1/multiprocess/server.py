@@ -64,6 +64,13 @@ if torch.cuda.is_available():
     # First Party
     import lmcache.c_ops as lmc_ops
 
+try:
+    from lmcache.v1.distributed.abo.compressed_memory_obj import (
+        CompressedMemoryObj,
+    )
+except ImportError:
+    CompressedMemoryObj = None
+
 logger = init_logger(__name__)
 
 
@@ -276,6 +283,9 @@ class MPCacheEngine:
         gpu_context = self.gpu_contexts[instance_id]
 
         blocks_per_chunk = self.chunk_size // gpu_context.block_size
+            
+        # ABO compress manager (may be None)
+        abo_mgr = self.storage_manager.abo_compress_manager
 
         with (
             torch.cuda.device(gpu_context.device),
@@ -335,6 +345,12 @@ class MPCacheEngine:
                     0,
                 )
                 lmcache_memcpy_async_d2h(tmp_buffer, memory_obj)
+
+                # ABO: per-chunk event + async compress trigger
+                if abo_mgr is not None and isinstance(memory_obj, CompressedMemoryObj):
+                    d2h_event = torch.cuda.Event()
+                    d2h_event.record()
+                    abo_mgr.submit_per_chunk_compress(d2h_event, obj_key, memory_obj)
 
             event.record()
 
@@ -419,6 +435,9 @@ class MPCacheEngine:
 
         blocks_per_chunk = self.chunk_size // gpu_context.block_size
 
+        # ABO decompress manager (for per-chunk staging release)
+        abo_decomp_mgr = self.storage_manager.abo_decompress_manager
+
         def _retrieve_loop(keys: list[ObjectKey], memory_objs: list[MemoryObj]) -> None:
             _BATCH_SIZE = 4
             for batch_idx, memory_obj_batch in enumerate(
@@ -460,12 +479,35 @@ class MPCacheEngine:
                     self.chunk_size, len(memory_obj_batch)
                 )
 
+                _h2d_error: Exception | None = None
+
                 # launch h2d for all the chunks in the batch
                 for tmp_buffer, memory_obj in zip(
                     tmp_buffers, memory_obj_batch, strict=False
                 ):
-                    assert memory_obj.tensor is not None
-                    lmcache_memcpy_async_h2d(memory_obj, tmp_buffer)
+                    try:
+                        # Skip H2D if a previous chunk already failed
+                        if _h2d_error is None:
+                            assert memory_obj.tensor is not None
+                            lmcache_memcpy_async_h2d(memory_obj, tmp_buffer)
+                    except Exception as e:
+                        if _h2d_error is None:
+                            _h2d_error = e
+                    finally:
+                        # ABO: per-chunk staging release (release staging buffer
+                        # after H2D completes, or release on error)
+                        if abo_decomp_mgr is not None and isinstance(
+                            memory_obj, CompressedMemoryObj
+                        ):
+                            h2d_event = torch.cuda.Event()
+                            h2d_event.record()
+                            abo_decomp_mgr.submit_per_chunk_release(
+                                h2d_event, memory_obj
+                            )
+
+                # After all chunks processed, raise the first error if any
+                if _h2d_error is not None:
+                    raise _h2d_error
 
                 # launch multi_layer_block_kv_transfer for all the chunks in the batch
                 lmc_ops.multi_layer_block_kv_transfer(
@@ -509,9 +551,13 @@ class MPCacheEngine:
             finally:
                 event.record()
                 if retrieve_succeeded:
+                    _keys = prefetched_keys
+
+                    def _finish_read_callback(_arg, _k=_keys):
+                        self.storage_manager.finish_read_prefetched(_k)
                     gpu_context.cupy_stream.launch_host_func(
-                        self.storage_manager.finish_read_prefetched,
-                        prefetched_keys,
+                        _finish_read_callback,
+                        None,
                     )
                 self._event_bus.publish_on_stream(
                     gpu_context.cupy_stream,

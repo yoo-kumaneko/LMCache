@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+from typing import Optional
+
+# Third Party
+import torch
+
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
@@ -12,6 +18,14 @@ from lmcache.v1.memory_management import (
     MemoryObj,
     MixedMemoryAllocator,
 )
+
+# ABO compression modules (optional dependency)
+try:
+    from lmcache.v1.distributed.abo.abo_codec import estimate_compressed_bytes
+    from lmcache.v1.distributed.abo.compressed_memory_obj import CompressedMemoryObj
+except ImportError:
+    estimate_compressed_bytes = None
+    CompressedMemoryObj = None
 
 logger = init_logger(__name__)
 
@@ -66,6 +80,24 @@ class L1MemoryManager:
         self._size_in_bytes = config.size_in_bytes
         self._align_bytes = config.align_bytes
 
+        # ABO compression components (injected by StorageManager after init)
+        self._abo_codec: Optional[object] = None  # abokvpress.HuffmanCodec instance
+        self._abo_codec_config: Optional[object] = None  # ABOConfig instance
+        self._is_abo_enabled: bool = False
+
+    def setup_abo(self, abo_codec, codec_config=None) -> None:
+        """Inject ABO compression components. Called by StorageManager at init.
+
+        Args:
+            abo_codec: abokvpress.HuffmanCodec instance (from ABOCodecFactory).
+            codec_config: ABOConfig instance (for estimate_compressed_bytes).
+        """
+        self._abo_codec = abo_codec
+        if codec_config is not None:
+            self._abo_codec_config = codec_config
+        self._is_abo_enabled = True
+        logger.info("L1MemoryManager ABO enabled")
+
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
     ) -> tuple[L1Error, list[MemoryObj]]:
@@ -93,6 +125,90 @@ class L1MemoryManager:
             return L1Error.OUT_OF_MEMORY, []
         return L1Error.SUCCESS, objects
 
+    def allocate_compressed(
+        self,
+        layout_desc: MemoryLayoutDesc,
+        count: int,
+        need_compresses: list[bool] = None,
+    ) -> tuple[L1Error, list[MemoryObj]]:
+        """Allocate compressed MemoryObj (ABO mode).
+
+        Allocates compressed-size L1 space as raw_data and creates CompressedMemoryObj.
+        Staging buffer is not allocated here but lazy-acquired in the .tensor getter.
+
+        Args:
+            layout_desc: Layout description of the original (uncompressed) data.
+            count: Number of objects to allocate.
+            need_compress: Whether compress is needed (True for STORE path,
+                False when loading from L2 in RETRIEVE path).
+
+        Returns:
+            tuple[L1Error, list[MemoryObj]]: Error code and list of allocated MemoryObj.
+        """
+        if not self._is_abo_enabled:
+            return L1Error.GENERIC_ERROR, []
+
+        assert self._abo_codec is not None
+
+        # Estimate compressed size using standalone function
+        original_shape = layout_desc.shapes[0]
+        original_dtype = layout_desc.dtypes[0]
+        ratio = (
+            self._abo_codec_config.ratio if self._abo_codec_config is not None else None
+        )
+        compressed_bytes = estimate_compressed_bytes(
+            original_shape, original_dtype, ratio=ratio
+        )
+
+        # Build compressed-size layout_desc
+        compressed_shape = torch.Size([compressed_bytes])
+        compressed_layout = MemoryLayoutDesc(
+            shapes=[compressed_shape],
+            dtypes=[torch.uint8],
+        )
+
+        # Allocate compressed-size space from L1 memory pool
+        raw_objects = self._allocator.batched_allocate(
+            compressed_layout.shapes, compressed_layout.dtypes, count
+        )
+        if raw_objects is None:
+            return L1Error.OUT_OF_MEMORY, []
+
+        if need_compresses is None:
+            need_compresses = [True] * count
+        # Wrap as CompressedMemoryObj
+        # Staging buffer is not allocated here but lazy-acquired in .tensor getter
+        compressed_objs: list[MemoryObj] = []
+        for raw_obj, need_compress in zip(raw_objects, need_compresses, strict=True):
+            # Save original metadata info into CompressedMemoryObj
+            # raw_obj's meta comes from allocator with correct address and phy_size
+            compressed_obj = CompressedMemoryObj(
+                raw_data=raw_obj.raw_data,
+                metadata=raw_obj.meta,
+                parent_allocator=raw_obj.parent_allocator,
+                staging_tensor=None,  # lazy allocation
+                original_shape=original_shape,
+                original_dtype=original_dtype,
+            )
+
+            # Mark whether compress is needed
+            compressed_obj._need_compress = need_compress
+
+            # Set original shape/dtype into meta (so upper-layer code can correctly
+            # interpret data)
+            compressed_obj.meta.shape = original_shape
+            compressed_obj.meta.dtype = original_dtype
+            compressed_obj.meta.shapes = layout_desc.shapes
+            compressed_obj.meta.dtypes = layout_desc.dtypes
+
+            compressed_objs.append(compressed_obj)
+
+            # Invalidate original raw_obj to avoid double-free
+            # (CompressedMemoryObj has taken over its raw_data and parent_allocator)
+            raw_obj.parent_allocator = None
+
+        return L1Error.SUCCESS, compressed_objs
+
     def free(self, mem_objs: list[MemoryObj]) -> L1Error:
         """
         Free the provided memory objects.
@@ -105,6 +221,11 @@ class L1MemoryManager:
             L1Error: Error code indicating the result of the operation.
             It will be `L1Error.SUCCESS` if the operation succeeds.
         """
+        # Release staging buffer for CompressedMemoryObj first
+        for obj in mem_objs:
+            if isinstance(obj, CompressedMemoryObj) and obj.has_staging:
+                obj.release_staging()
+
         self._allocator.batched_free(mem_objs)
         return L1Error.SUCCESS
 

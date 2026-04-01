@@ -6,7 +6,7 @@ Configuration for distributed storage manager
 
 # Standard
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Optional
 import argparse
 
 # First Party
@@ -72,6 +72,52 @@ class EvictionConfig:
 
 
 @dataclass
+class ABOConfig:
+    """
+    ABO KV compression configuration.
+    When enabled, L1 stores compressed KV data with StagingPool providing
+    GPU↔CPU transfer intermediary, reducing L1 memory usage while preserving
+    D2H/H2D and compress/decompress overlap.
+    """
+
+    enable: bool = field(default=False)
+    """ Whether to enable ABO KV compression. """
+
+    staging_size_gb: float = field(default=16.0)
+    """ Pinned memory size (GB) used by StagingPool. """
+
+    ratio: Optional[int] = field(default=None)
+    """ Compression ratio (20-32). None means auto-detect by dtype. """
+
+    codec: str = field(default="huffman")
+    """ Codec method, default is huffman. """
+
+    num_threads: int = field(default=32)
+    """ Number of threads for compress/decompress. """
+
+    def __post_init__(self):
+        if self.enable:
+            if self.staging_size_gb <= 0:
+                raise ValueError(
+                    f"abo_staging_size_gb must be positive, got: {self.staging_size_gb}"
+                )
+            if self.ratio is not None and not (20 <= self.ratio <= 32):
+                raise ValueError(f"abo_ratio must be in range 20-32, got: {self.ratio}")
+            if self.num_threads <= 0:
+                raise ValueError(
+                    f"abo_num_threads must be a positive integer, got: {self.num_threads}"
+                )
+            # Lazy import to check if abokvpress is available
+            try:
+                import abokvpress  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    "Enabling ABO compression (enable_abo=True) requires the abokvpress library. "
+                    "Please run: pip install abokvpress"
+                ) from e
+
+
+@dataclass
 class StorageManagerConfig:
     """
     The configuration for the distributed storage manager.
@@ -93,6 +139,9 @@ class StorageManagerConfig:
 
     prefetch_policy: str = "default"
     """ The L2 prefetch policy name. """
+
+    abo_config: ABOConfig = field(default_factory=ABOConfig)
+    """ ABO KV compression configuration. """
 
 
 def add_storage_manager_args(
@@ -228,6 +277,41 @@ def add_storage_manager_args(
         "Default is 'default' (pick the first adapter by index).",
     )
 
+    # ABO compression configuration
+    abo_group = parser.add_argument_group(
+        "ABO Compression", "KV cache ABO compression configuration"
+    )
+    abo_group.add_argument(
+        "--enable-abo",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to enable ABO KV compression. Default is False.",
+    )
+    abo_group.add_argument(
+        "--abo-staging-size-gb",
+        type=float,
+        default=16.0,
+        help="StagingPool pinned memory size in GB. Default is 16.0.",
+    )
+    abo_group.add_argument(
+        "--abo-ratio",
+        type=int,
+        default=None,
+        help="Compression ratio (20-32). Default is auto-detect by dtype.",
+    )
+    abo_group.add_argument(
+        "--abo-codec",
+        type=str,
+        default="huffman",
+        help='Codec method for ABO compression. Default is "huffman".',
+    )
+    abo_group.add_argument(
+        "--abo-num-threads",
+        type=int,
+        default=32,
+        help="Number of threads for ABO compress/decompress. Default is 32.",
+    )
+
     # Adapter config
     add_l2_adapters_args(parser)
     return parser
@@ -284,12 +368,21 @@ def parse_args_to_config(
 
     l2_adapter_config = parse_args_to_l2_adapters_config(args)
 
+    abo_config = ABOConfig(
+        enable=args.enable_abo,
+        staging_size_gb=args.abo_staging_size_gb,
+        ratio=args.abo_ratio,
+        codec=args.abo_codec,
+        num_threads=args.abo_num_threads,
+    )
+
     return StorageManagerConfig(
         l1_manager_config=l1_manager_config,
         eviction_config=eviction_config,
         l2_adapter_config=l2_adapter_config,
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,
+        abo_config=abo_config,
     )
 
 

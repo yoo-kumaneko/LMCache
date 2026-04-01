@@ -558,6 +558,13 @@ class FSL2Adapter(L2AdapterInterface):
                 if await aiofiles.os.path.exists(file_path):
                     continue
                 buf = obj.byte_array
+                # ABO: byte_array returns None if compress failed or timed out
+                if buf is None:
+                    logger.warning(
+                        "FSL2Adapter: byte_array is None for key %s, skipping store",
+                        file_path.name,
+                    )
+                    continue
                 size = len(buf)
 
                 try:

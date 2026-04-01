@@ -60,13 +60,15 @@ def _object_key_to_string(key: ObjectKey) -> str:
 
 def _obj_to_memoryview(
     obj: MemoryObj,
-) -> memoryview:  # type: ignore[type-arg]
+) -> Optional[memoryview]:  # type: ignore[type-arg]
     """
     Extract a byte-oriented memoryview from a MemoryObj.
 
     Uses the MemoryObj's byte_array property which returns
     a ctypes-backed memoryview with itemsize=1, so pybind's
     buffer_info.size == num_bytes.
+
+    Returns None if byte_array is None (e.g. ABO compress failed).
     """
     return obj.byte_array  # type: ignore[return-value]
 
@@ -155,19 +157,43 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         keys: list[ObjectKey],
         objects: list[MemoryObj],
     ) -> L2TaskId:
-        key_strings = [_object_key_to_string(k) for k in keys]
-        memviews = [_obj_to_memoryview(obj) for obj in objects]
+        # Filter out objects whose byte_array is None (e.g. ABO compress failed)
+        filtered_keys = []
+        filtered_memviews = []
+        for k, obj in zip(keys, objects):
+            mv = _obj_to_memoryview(obj)
+            if mv is None:
+                logger.warning(
+                    "NativeConnectorL2Adapter: byte_array is None for key %s, "
+                    "skipping store",
+                    _object_key_to_string(k),
+                )
+                continue
+            filtered_keys.append(k)
+            filtered_memviews.append(mv)
+
+        if not filtered_keys:
+            # All objects failed compress; return a task that immediately succeeds
+            with self._lock:
+                task_id = self._get_next_task_id()
+                self._completed_stores[task_id] = True
+            os.eventfd_write(self._store_efd, 1)
+            return task_id
+
+        key_strings = [_object_key_to_string(k) for k in filtered_keys]
 
         # Register pending op BEFORE submit to avoid race
         # with demux thread. The native submit is
         # non-blocking so holding the lock is brief.
         with self._lock:
             task_id = self._get_next_task_id()
-            future_id = int(self._client.submit_batch_set(key_strings, memviews))
+            future_id = int(
+                self._client.submit_batch_set(key_strings, filtered_memviews)
+            )
             self._pending_ops[future_id] = (
                 self._OP_STORE,
                 task_id,
-                len(keys),
+                len(filtered_keys),
                 None,
             )
 

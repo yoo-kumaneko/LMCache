@@ -38,6 +38,30 @@ from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 
+# ABO compression modules (optional dependency)
+try:
+    from lmcache.v1.distributed.abo.abo_codec import (
+        _DEFAULT_RATIO,
+        ABOCodecFactory,
+        ABOConfig,
+        resolve_abo_dtype,
+    )
+    from lmcache.v1.distributed.abo.compress_manager import ABOCompressManager
+    from lmcache.v1.distributed.abo.decompress_manager import ABODecompressManager
+    from lmcache.v1.distributed.abo.staging_pool import StagingPool
+    from lmcache.v1.lazy_memory_allocator import LazyMemoryAllocator
+    from lmcache.v1.memory_management import get_size_bytes
+except ImportError:
+    _DEFAULT_RATIO = None
+    ABOCodecFactory = None
+    ABOConfig = None
+    resolve_abo_dtype = None
+    ABOCompressManager = None
+    ABODecompressManager = None
+    StagingPool = None
+    LazyMemoryAllocator = None
+    get_size_bytes = None
+
 logger = init_logger(__name__)
 
 
@@ -65,7 +89,16 @@ class StorageManager:
         self._l1_manager = L1Manager(config.l1_manager_config)
         self._event_bus = get_event_bus()
 
-        # L1 eviction controller
+        # ABO compression initialization
+        self._abo_config = config.abo_config
+        self._abo_codec = None
+        self._staging_pool = None
+        self._abo_compress_manager = None
+        self._abo_decompress_manager = None
+        if self._abo_config.enable:
+            self._init_abo(config)
+
+        # Eviction controller
         self._eviction_controller = L1EvictionController(
             l1_manager=self._l1_manager,
             eviction_config=config.eviction_config,
@@ -115,6 +148,163 @@ class StorageManager:
         )
         self._prefetch_controller.start()
 
+    def _init_abo(self, config: StorageManagerConfig) -> None:
+        """
+        Initialize ABO compression components (StagingPool, codec, PIN_CHUNK_SIZE).
+        """
+        abo = config.abo_config
+        logger.info(
+            "Initializing ABO compression:"
+            "staging_size=%.1fGB, ratio=%s, codec=%s, threads=%d",
+            abo.staging_size_gb,
+            abo.ratio,
+            abo.codec,
+            abo.num_threads,
+        )
+
+        # 1. Create codec via ABOCodecFactory (returns abokvpress.HuffmanCodec directly)
+        codec_config = ABOConfig(
+            ratio=abo.ratio,
+            codec_method=abo.codec,
+            num_threads=abo.num_threads,
+        )
+        self._abo_codec = ABOCodecFactory.create_codec(abo.codec, codec_config)
+        self._abo_codec_config = (
+            codec_config  # Keep config for estimate_compressed_bytes
+        )
+
+        # 2. Create ABOCompressManager (stream mode) with on_compress_failed callback
+        # NOTE: abo_dtype and ratio are set later in _ensure_staging_pool
+        # once the KV dtype is known from layout_desc.
+        def _on_compress_failed(obj_key):
+            """
+            Callback when ABO compress fails: abort write to remove invalid key from L1.
+            """
+            try:
+                result = self._l1_manager.abort_write([obj_key])
+                logger.warning(
+                    "ABO compress failed for key %s, abort_write result: %s",
+                    obj_key,
+                    result,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to abort_write after compress failure (key=%s): %s",
+                    obj_key,
+                    e,
+                )
+
+        self._abo_compress_manager = ABOCompressManager(
+            codec=self._abo_codec,
+            on_compress_failed=_on_compress_failed,
+        )
+
+        # 3. Create ABODecompressManager
+        self._abo_decompress_manager = ABODecompressManager(
+            codec=self._abo_codec,
+        )
+
+        # 4. Inject codec + config into L1MemoryManager (no StagingPool yet)
+        # So Prefetch path can also allocate compressed-size space
+        self._l1_manager._memory_manager.setup_abo(
+            self._abo_codec, codec_config=codec_config
+        )
+
+        # 5. Record staging config for lazy initialization
+        # Note: staging buffer size needs to be determined by actual KV chunk size
+        # at first reserve_write. Record config here, lazily initialize StagingPool
+        # on first use.
+        self._staging_size_gb = abo.staging_size_gb
+        self._staging_pool = None  # Lazily initialized
+
+        logger.info(
+            "ABO compression initialized"
+            "(StagingPool will be lazily created on first reserve_write)"
+        )
+
+    def _ensure_staging_pool(self, layout_desc: MemoryLayoutDesc) -> None:
+        """Ensure StagingPool is initialized (lazy initialization).
+
+        On first call, computes KV chunk size from layout_desc and creates StagingPool.
+        Also adjusts LazyMemoryAllocator.PIN_CHUNK_SIZE.
+
+        Args:
+            layout_desc: Layout description of KV data.
+        """
+        if self._staging_pool is not None:
+            return
+
+        # Compute uncompressed byte size of a single KV chunk
+        kv_chunk_bytes = get_size_bytes(layout_desc.shapes, layout_desc.dtypes)
+
+        # Adjust PIN_CHUNK_SIZE to be >= kv_chunk_size
+        old_pin_chunk_size = LazyMemoryAllocator.PIN_CHUNK_SIZE
+        new_pin_chunk_size = max(old_pin_chunk_size, kv_chunk_bytes)
+        if new_pin_chunk_size != old_pin_chunk_size:
+            LazyMemoryAllocator.PIN_CHUNK_SIZE = new_pin_chunk_size
+            logger.info(
+                "Adjusted LazyMemoryAllocator.PIN_CHUNK_SIZE: %d -> %d "
+                "(kv_chunk_bytes=%d)",
+                old_pin_chunk_size,
+                new_pin_chunk_size,
+                kv_chunk_bytes,
+            )
+
+        # Compute pool_size
+        staging_size_bytes = int(self._staging_size_gb * (1 << 30))
+        pool_size = staging_size_bytes // kv_chunk_bytes
+        if pool_size < 32:
+            logger.warning(
+                "StagingPool pool_size=%d is too small (recommend >= 32), "
+                "staging_size=%.1fGB, kv_chunk_bytes=%d",
+                pool_size,
+                self._staging_size_gb,
+                kv_chunk_bytes,
+            )
+            pool_size = max(pool_size, 32)
+
+        self._staging_pool = StagingPool(
+            pool_size=pool_size,
+            buffer_bytes=kv_chunk_bytes,
+        )
+
+        # Inject StagingPool into CompressedMemoryObj class-level variable
+        from lmcache.v1.distributed.abo.compressed_memory_obj import CompressedMemoryObj
+
+        CompressedMemoryObj.set_staging_pool(self._staging_pool)
+
+        # Resolve ABO dtype and ratio from layout_desc, then set on compress manager
+        kv_dtype = layout_desc.dtypes[0]
+        abo_dtype = resolve_abo_dtype(kv_dtype)
+        ratio = self._abo_config.ratio
+        if ratio is None:
+            ratio = _DEFAULT_RATIO[abo_dtype]
+
+        self._abo_compress_manager.set_abo_params(abo_dtype, ratio)
+
+        logger.info(
+            "StagingPool created and ABO params set: "
+            "abo_dtype=%s, ratio=%d, kv_dtype=%s",
+            abo_dtype,
+            ratio,
+            kv_dtype,
+        )
+
+    @property
+    def is_abo_enabled(self) -> bool:
+        """Whether ABO compression is enabled."""
+        return self._abo_config.enable
+
+    @property
+    def abo_compress_manager(self):
+        """Get the ABO compress manager (may be None)."""
+        return self._abo_compress_manager
+
+    @property
+    def abo_decompress_manager(self):
+        """Get the ABO decompress manager (may be None)."""
+        return self._abo_decompress_manager
+
     # External APIs for serving engine integration code to call
     def reserve_write(
         self,
@@ -139,6 +329,10 @@ class StorageManager:
                 reserved memory objects. Note that not all requested keys could be
                 reserved (e.g., out of memory or write conflict)
         """
+        # ABO mode: ensure StagingPool is initialized
+        if self._abo_config.enable:
+            self._ensure_staging_pool(layout_desc)
+
         reserve_result = self._l1_manager.reserve_write(
             keys=keys,
             is_temporary=[False] * len(keys),
@@ -232,6 +426,12 @@ class StorageManager:
         successfully_yielded = False
 
         try:
+            # ABO: submit async decompress tasks for CompressedMemoryObj
+            if all_good and self._abo_decompress_manager is not None:
+                self._abo_decompress_manager.prepare_decompress_batch(
+                    good_objs, is_retrieve=True
+                )
+
             yield good_objs if all_good else None
             successfully_yielded = True
         except Exception:
@@ -337,6 +537,18 @@ class StorageManager:
                 },
             )
         )
+
+        # ABO: trigger early decompress for L1-hit objects (non-blocking)
+        if hit_count > 0 and self._abo_decompress_manager is not None:
+            l1_hit_objs = [
+                l1_read_result[k][1]
+                for k in keys[:hit_count]
+                if k in l1_read_result and l1_read_result[k][1] is not None
+            ]
+            if l1_hit_objs:
+                self._abo_decompress_manager.prepare_decompress_batch(
+                    l1_hit_objs, is_retrieve=False
+                )
 
         # Submit remaining keys to L2 prefetch controller
         remaining_keys = keys[hit_count:]
@@ -479,6 +691,14 @@ class StorageManager:
 
         for adapter in self._l2_adapters:
             adapter.close()
+
+        # Close ABO compress manager
+        if self._abo_compress_manager is not None:
+            self._abo_compress_manager.close()
+
+        # Close ABO decompress manager
+        if self._abo_decompress_manager is not None:
+            self._abo_decompress_manager.close()
 
         self._l1_manager.close()
 

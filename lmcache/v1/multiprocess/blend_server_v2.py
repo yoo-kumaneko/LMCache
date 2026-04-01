@@ -92,6 +92,13 @@ from lmcache.v1.multiprocess.token_hasher import (
     update_table_id_numba,
 )
 
+try:
+    from lmcache.v1.distributed.abo.compressed_memory_obj import (
+        CompressedMemoryObj,
+    )
+except ImportError:
+    CompressedMemoryObj = None
+
 logger = init_logger(__name__)
 
 
@@ -503,6 +510,9 @@ class BlendEngineV2(MPCacheEngine):
                 obj_keys, layout_desc, "new"
             )
 
+            # ABO compress manager (may be None)
+            abo_mgr = self.storage_manager.abo_compress_manager
+
             for idx, obj_key in enumerate(obj_keys):
                 if obj_key in reserved_dict:
                     memory_obj = reserved_dict[obj_key]
@@ -520,6 +530,12 @@ class BlendEngineV2(MPCacheEngine):
                 with self.lock:
                     tmp_buffer.copy_(gpu_kv_slice, non_blocking=True)
                     lmcache_memcpy_async_d2h(tmp_buffer, memory_obj)
+
+                    # ABO: per-chunk event + async compress trigger
+                if abo_mgr is not None and isinstance(memory_obj, CompressedMemoryObj):
+                    d2h_event = torch.cuda.Event()
+                    d2h_event.record()
+                    abo_mgr.submit_per_chunk_compress(d2h_event, obj_key, memory_obj)
 
             event.record()
 
@@ -638,6 +654,9 @@ class BlendEngineV2(MPCacheEngine):
 
         logger.debug("DEBUG object keys to retrieve: %s", all_obj_keys)
 
+        # ABO decompress manager (for per-chunk staging release)
+        abo_decomp_mgr = self.storage_manager.abo_decompress_manager
+
         with (
             torch.cuda.device(gpu_context.device),
             torch.cuda.stream(gpu_context.stream),
@@ -652,18 +671,43 @@ class BlendEngineV2(MPCacheEngine):
                         logger.error("Some keys not found during CB retrieve!")
                         return event.ipc_handle(), False
 
+                    _h2d_error: Exception | None = None
                     for r, memory_obj in zip(
                         cb_match_result, memory_objs, strict=False
                     ):
                         gpu_st = r.cur_st + offset
                         gpu_ed = gpu_st + self.chunk_size
-                        tmp_buffer = gpu_context.get_tmp_gpu_buffer(self.chunk_size)
-                        target_buffer = gpu_context.slice_kv_cache_on_tokens(
-                            gpu_st, gpu_ed
-                        )
-                        with self.lock:
-                            lmcache_memcpy_async_h2d(memory_obj, tmp_buffer)
-                            target_buffer.copy_(tmp_buffer, non_blocking=True)
+
+                        try:
+                            # Skip H2D if a previous chunk already failed
+                            if _h2d_error is None:
+                                tmp_buffer = gpu_context.get_tmp_gpu_buffer(
+                                    self.chunk_size
+                                )
+                                target_buffer = gpu_context.slice_kv_cache_on_tokens(
+                                    gpu_st, gpu_ed
+                                )
+                                with self.lock:
+                                    lmcache_memcpy_async_h2d(memory_obj, tmp_buffer)
+                                    target_buffer.copy_(tmp_buffer, non_blocking=True)
+                        except Exception as e:
+                            if _h2d_error is None:
+                                _h2d_error = e
+                        finally:
+                            # ABO: per-chunk staging release (release staging buffer
+                            # after H2D completes, or release on error)
+                            if abo_decomp_mgr is not None and isinstance(
+                                memory_obj, CompressedMemoryObj
+                            ):
+                                h2d_event = torch.cuda.Event()
+                                h2d_event.record()
+                                abo_decomp_mgr.submit_per_chunk_release(
+                                    h2d_event, memory_obj
+                                )
+
+                    # After all chunks processed, raise the first error if any
+                    if _h2d_error is not None:
+                        raise _h2d_error
 
             except Exception:
                 logger.exception("Error during retrieving prefetched results")
