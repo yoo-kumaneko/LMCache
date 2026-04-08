@@ -8,6 +8,9 @@ Configuration for the multiprocess (ZMQ) server and HTTP frontend.
 from dataclasses import dataclass, field
 import argparse
 
+# First Party
+from lmcache.v1.multiprocess.chunk_hash_logger import ChunkHashLogConfig
+
 
 @dataclass
 class MPServerConfig:
@@ -43,6 +46,9 @@ class MPServerConfig:
 
     runtime_plugin_locations: list[str] = field(default_factory=list)
     """Paths to runtime plugin scripts or directories."""
+
+    chunk_hash_log: ChunkHashLogConfig = field(default_factory=ChunkHashLogConfig)
+    """Configuration for chunk hash file logging."""
 
 
 DEFAULT_MP_SERVER_CONFIG = MPServerConfig()
@@ -141,6 +147,40 @@ def add_mp_server_args(
         help="Paths to runtime plugin scripts or "
         "directories to launch alongside the server.",
     )
+
+    # Chunk hash logging config
+    log_group = parser.add_argument_group(
+        "Chunk Hash Logging",
+        "Configuration for chunk hash file logging (offline analysis)",
+    )
+    log_group.add_argument(
+        "--chunk-hash-log-dir",
+        type=str,
+        default="",
+        help="Directory to write chunk hash JSONL files for offline analysis. "
+        "Empty string (default) disables logging.",
+    )
+    log_group.add_argument(
+        "--chunk-hash-log-rotation-interval",
+        type=int,
+        default=6 * 3600,
+        help="Time interval in seconds before rotating to a new log file. "
+        "Default is 21600 (6 hours).",
+    )
+    log_group.add_argument(
+        "--chunk-hash-log-rotation-max-size",
+        type=int,
+        default=100 * 1024 * 1024,
+        help="Max file size in bytes before rotating even if the time "
+        "interval has not elapsed. Default is 100MB (104857600).",
+    )
+    log_group.add_argument(
+        "--chunk-hash-log-max-files",
+        type=int,
+        default=100,
+        help="Max number of chunk hash log files to keep. "
+        "Oldest files are deleted when this limit is exceeded. Default is 100.",
+    )
     return parser
 
 
@@ -169,6 +209,12 @@ def parse_args_to_mp_server_config(
         hash_algorithm=args.hash_algorithm,
         engine_type=args.engine_type,
         runtime_plugin_locations=(args.runtime_plugin_locations or []),
+        chunk_hash_log=ChunkHashLogConfig(
+            output_dir=args.chunk_hash_log_dir,
+            rotation_interval_sec=args.chunk_hash_log_rotation_interval,
+            rotation_max_size=args.chunk_hash_log_rotation_max_size,
+            max_files=args.chunk_hash_log_max_files,
+        ),
     )
 
 

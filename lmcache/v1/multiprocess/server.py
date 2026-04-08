@@ -41,6 +41,10 @@ from lmcache.v1.mp_observability.config import (
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
+from lmcache.v1.multiprocess.chunk_hash_logger import (
+    ChunkHashLogConfig,
+    ChunkHashLogger,
+)
 from lmcache.v1.multiprocess.config import (
     MPServerConfig,
     add_mp_server_args,
@@ -183,6 +187,7 @@ class MPCacheEngine:
         storage_manager_config: StorageManagerConfig,
         chunk_size: int = 256,
         hash_algorithm: str = "blake3",
+        chunk_hash_log_config: ChunkHashLogConfig | None = None,
     ):
         # GPU ID -> KV cache tensors
         self.gpu_contexts: dict[int, GPUCacheContext] = {}
@@ -226,6 +231,13 @@ class MPCacheEngine:
         # retrieve().
         self._pending_lookups: dict[str, _PendingLookupState] = {}
         self._pending_lookups_lock = threading.Lock()
+
+        # Optional chunk hash file logger for offline analysis
+        self.chunk_hash_logger: ChunkHashLogger | None = None
+        if chunk_hash_log_config and chunk_hash_log_config.enabled:
+            self.chunk_hash_logger = ChunkHashLogger(
+                config=chunk_hash_log_config,
+            )
 
     def register_kv_cache(
         self,
@@ -663,6 +675,11 @@ class MPCacheEngine:
                     request_id=key.request_id,
                 )
             )
+
+        # Log chunk hashes for offline analysis (non-blocking)
+        if self.chunk_hash_logger is not None:
+            self.chunk_hash_logger.log(key.request_id, chunk_hashes, model_name)
+
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
         handle = self.storage_manager.submit_prefetch_task(
@@ -1006,6 +1023,10 @@ class MPCacheEngine:
         """
         Closes the MPCacheEngine and releases all resources.
         """
+        # Close chunk hash logger
+        if self.chunk_hash_logger is not None:
+            self.chunk_hash_logger.close()
+
         # Close storage manager
         self.storage_manager.close()
         logger.info("MPCacheEngine closed")
@@ -1065,6 +1086,7 @@ def run_cache_server(
         storage_manager_config=storage_manager_config,
         chunk_size=mp_config.chunk_size,
         hash_algorithm=mp_config.hash_algorithm,
+        chunk_hash_log_config=mp_config.chunk_hash_log,
     )
 
     # Initialize the message queue server
