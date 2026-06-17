@@ -188,8 +188,8 @@ class LookupModule:
             )
         )
 
-        layout_descs = self._ctx.layout_desc_registry.find(model_name, world_size)
-        if layout_descs is None:
+        registry_entry = self._ctx.layout_desc_registry.find(model_name, world_size)
+        if registry_entry is None:
             logger.error(
                 "No GPU context found for model %s with world size %d during lookup!",
                 model_name,
@@ -214,6 +214,7 @@ class LookupModule:
             return
 
         extra_count = compute_extra_count(tp_size, world_size)
+        layout_descs, sw_size_chunks_per_og = registry_entry
 
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
         if not chunk_hashes:
@@ -272,15 +273,31 @@ class LookupModule:
         # hit counting (its handle is tracked by the prefetch job); the
         # remaining groups are prefetched to ensure their read locks are held
         # before retrieve() runs.
+        #
+        # For SWA object groups (sw_size_chunks >= 1), only the trailing
+        # sw_size_chunks keys are needed — retrieve skips leading chunks.
+        # We slice the key list to the tail so PREFIX policy produces the
+        # correct contiguous-from-the-window hit count.
+        def _trim_keys_for_og(
+            og_keys: list, sw_size_chunks: int
+        ) -> list:
+            if sw_size_chunks >= 1:
+                return og_keys[-sw_size_chunks:]
+            return og_keys
+
+        trimmed_keys_0 = _trim_keys_for_og(all_obj_keys[0], sw_size_chunks_per_og[0])
         handle = self._ctx.storage_manager.submit_prefetch_task(
-            all_obj_keys[0],
+            trimmed_keys_0,
             layout_descs[0],
             extra_count=extra_count,
             external_request_id=key.request_id,
         )
         for og_id in range(1, len(layout_descs)):
+            trimmed_keys = _trim_keys_for_og(
+                all_obj_keys[og_id], sw_size_chunks_per_og[og_id]
+            )
             self._ctx.storage_manager.submit_prefetch_task(
-                all_obj_keys[og_id],
+                trimmed_keys,
                 layout_descs[og_id],
                 extra_count=extra_count,
                 external_request_id=key.request_id,
@@ -411,19 +428,26 @@ class LookupModule:
         if not chunk_hashes:
             return
 
-        layout_descs = self._ctx.layout_desc_registry.find(
+        registry_entry = self._ctx.layout_desc_registry.find(
             key.model_name, key.world_size
         )
-        num_object_groups = len(layout_descs) if layout_descs else 1
+        if registry_entry is not None:
+            _, sw_size_chunks_per_og = registry_entry
+            num_object_groups = len(sw_size_chunks_per_og)
+        else:
+            sw_size_chunks_per_og = [-1]
+            num_object_groups = 1
         all_obj_keys = ipc_key_to_object_keys(
             key, chunk_hashes, list(range(num_object_groups))
         )
 
         extra_count = compute_extra_count(tp_size, key.world_size)
 
-        for obj_keys in all_obj_keys:
+        for og_id, obj_keys in enumerate(all_obj_keys):
+            sw = sw_size_chunks_per_og[og_id] if og_id < len(sw_size_chunks_per_og) else -1
+            trimmed = obj_keys[-sw:] if sw >= 1 else obj_keys
             self._ctx.storage_manager.finish_read_prefetched(
-                obj_keys, extra_count=extra_count
+                trimmed, extra_count=extra_count
             )
 
     def end_session(self, request_id: str) -> None:
@@ -457,10 +481,15 @@ class LookupModule:
 
         chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
         key = session.lookup_ipc_key
-        layout_descs = self._ctx.layout_desc_registry.find(
+        registry_entry = self._ctx.layout_desc_registry.find(
             key.model_name, key.world_size
         )
-        num_object_groups = len(layout_descs) if layout_descs else 1
+        if registry_entry is not None:
+            _, sw_size_chunks_per_og = registry_entry
+            num_object_groups = len(sw_size_chunks_per_og)
+        else:
+            sw_size_chunks_per_og = [-1]
+            num_object_groups = 1
         all_obj_keys = ipc_key_to_object_keys(
             key, chunk_hashes, list(range(num_object_groups))
         )
@@ -468,8 +497,10 @@ class LookupModule:
         # TODO(chunxiaozheng): when l2 is enabled, the prefetched keys from l2 are temp
         #  and will be deleted after finish_read_prefetched, when we touch all keys,
         #  these keys has been deleted and will not be touched.
-        for obj_keys in all_obj_keys:
-            self._ctx.storage_manager.touch_l1_keys(obj_keys)
+        for og_id, obj_keys in enumerate(all_obj_keys):
+            sw = sw_size_chunks_per_og[og_id] if og_id < len(sw_size_chunks_per_og) else -1
+            trimmed = obj_keys[-sw:] if sw >= 1 else obj_keys
+            self._ctx.storage_manager.touch_l1_keys(trimmed)
 
     # -----------------------------------------------------------------
     # Internal helpers

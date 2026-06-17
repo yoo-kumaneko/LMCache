@@ -40,21 +40,25 @@ class _LayoutDescEntry:
 
     ``layout_descs`` is indexed by object group id: one ``MemoryLayoutDesc``
     per object group, in object-group order.
+
+    ``sw_size_chunks_per_og`` is the sliding window size in chunks for each
+    object group (-1 for full-attention groups).
     """
 
     layout_descs: list[MemoryLayoutDesc]
+    sw_size_chunks_per_og: list[int]
     ref_count: int
 
 
 class LayoutDescRegistry:
     """Thread-safe registry mapping (model_name, world_size) to per-object-group
-    layout descriptors.
+    layout descriptors and sliding-window sizes.
 
     Modules write to this registry when KV caches are registered.
     Consumers (e.g. LookupModule) read from it to find layout descriptors
-    for prefetch tasks. Multiple worker instances can share the same
-    ``(model_name, world_size)`` entry, so the registry keeps the descriptors
-    until the last matching registration is unregistered.
+    and sliding-window sizes for prefetch tasks. Multiple worker instances
+    can share the same ``(model_name, world_size)`` entry, so the registry
+    keeps the descriptors until the last matching registration is unregistered.
     """
 
     def __init__(self) -> None:
@@ -67,6 +71,7 @@ class LayoutDescRegistry:
         model_name: str,
         world_size: int,
         layout_descs: list[MemoryLayoutDesc],
+        sw_size_chunks_per_og: list[int],
     ) -> None:
         """Register layout descriptors for a (model_name, world_size) pair.
 
@@ -78,6 +83,8 @@ class LayoutDescRegistry:
             world_size: The world size.
             layout_descs: One ``MemoryLayoutDesc`` per object group, in
                 object-group order.
+            sw_size_chunks_per_og: Sliding window size in chunks for each
+                object group. -1 for full-attention groups.
         """
         key = (model_name, world_size)
         with self._lock:
@@ -85,11 +92,13 @@ class LayoutDescRegistry:
             if entry is None:
                 self._registry[key] = _LayoutDescEntry(
                     layout_descs=layout_descs,
+                    sw_size_chunks_per_og=sw_size_chunks_per_og,
                     ref_count=1,
                 )
                 return
 
             entry.layout_descs = layout_descs
+            entry.sw_size_chunks_per_og = sw_size_chunks_per_og
             entry.ref_count += 1
 
     def unregister(self, model_name: str, world_size: int) -> None:
@@ -116,22 +125,25 @@ class LayoutDescRegistry:
 
     def find(
         self, model_name: str, world_size: int
-    ) -> list[MemoryLayoutDesc] | None:
-        """Look up layout descriptors by (model_name, world_size).
+    ) -> tuple[list[MemoryLayoutDesc], list[int]] | None:
+        """Look up layout descriptors and SW sizes by (model_name, world_size).
 
         Args:
             model_name: The model name.
             world_size: The world size.
 
         Returns:
-            The list of layout descriptors (one per object group) if found,
-            otherwise None.
+            A tuple of (layout_descs, sw_size_chunks_per_og) if found,
+            where layout_descs is one MemoryLayoutDesc per object group and
+            sw_size_chunks_per_og is the sliding window size in chunks for
+            each object group (-1 for full-attention). Returns None if not
+            found.
         """
         with self._lock:
             entry = self._registry.get((model_name, world_size))
             if entry is None:
                 return None
-            return entry.layout_descs
+            return entry.layout_descs, entry.sw_size_chunks_per_og
 
 
 class MPCacheServerContext:

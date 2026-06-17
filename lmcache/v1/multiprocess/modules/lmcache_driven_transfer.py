@@ -668,11 +668,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             engine_group_infos=engine_group_infos,
             engine_type=engine_type,
         )
+        manager = cache_context.kv_layer_groups_manager
         layout_descs = [
             get_layout_desc(cache_context, self._ctx.chunk_size, og_id)
-            for og_id in range(cache_context.kv_layer_groups_manager.num_object_groups)
+            for og_id in range(manager.num_object_groups)
         ]
-        self._ctx.layout_desc_registry.register(model_name, world_size, layout_descs)
+        sw_size_chunks_per_og = [
+            manager.get_sw_size_chunks(og_id)
+            for og_id in range(manager.num_object_groups)
+        ]
+        self._ctx.layout_desc_registry.register(
+            model_name, world_size, layout_descs, sw_size_chunks_per_og
+        )
 
         with self._lock:
             self._cache_contexts[instance_id] = ContextEntry(
