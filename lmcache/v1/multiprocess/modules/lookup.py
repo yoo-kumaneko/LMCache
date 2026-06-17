@@ -188,8 +188,8 @@ class LookupModule:
             )
         )
 
-        layout_desc = self._ctx.layout_desc_registry.find(model_name, world_size)
-        if layout_desc is None:
+        layout_descs = self._ctx.layout_desc_registry.find(model_name, world_size)
+        if layout_descs is None:
             logger.error(
                 "No GPU context found for model %s with world size %d during lookup!",
                 model_name,
@@ -256,8 +256,8 @@ class LookupModule:
                         "model_name": model_name,
                         "chunk_size": self._ctx.chunk_size,
                         "seq_len": len(key.token_ids),
-                        "dtypes": [str(d) for d in layout_desc.dtypes],
-                        "shapes": [list(s) for s in layout_desc.shapes],
+                        "dtypes": [str(d) for ld in layout_descs for d in ld.dtypes],
+                        "shapes": [list(s) for ld in layout_descs for s in ld.shapes],
                     },
                 )
             )
@@ -266,14 +266,25 @@ class LookupModule:
         session.set_tokens(list(key.token_ids))
         session.lookup_ipc_key = key
 
-        obj_keys = ipc_key_to_object_keys(key, chunk_hashes, [0])[0]
+        all_obj_keys = ipc_key_to_object_keys(key, chunk_hashes, list(range(len(layout_descs))))
 
+        # Submit a prefetch task for each object group. Object group 0 drives
+        # hit counting (its handle is tracked by the prefetch job); the
+        # remaining groups are prefetched to ensure their read locks are held
+        # before retrieve() runs.
         handle = self._ctx.storage_manager.submit_prefetch_task(
-            obj_keys,
-            layout_desc,
+            all_obj_keys[0],
+            layout_descs[0],
             extra_count=extra_count,
             external_request_id=key.request_id,
         )
+        for og_id in range(1, len(layout_descs)):
+            self._ctx.storage_manager.submit_prefetch_task(
+                all_obj_keys[og_id],
+                layout_descs[og_id],
+                extra_count=extra_count,
+                external_request_id=key.request_id,
+            )
         self._register_prefetch_job(
             _PrefetchJob(
                 handle=handle,
@@ -399,13 +410,21 @@ class LookupModule:
         )
         if not chunk_hashes:
             return
-        obj_keys = ipc_key_to_object_keys(key, chunk_hashes, [0])[0]
+
+        layout_descs = self._ctx.layout_desc_registry.find(
+            key.model_name, key.world_size
+        )
+        num_object_groups = len(layout_descs) if layout_descs else 1
+        all_obj_keys = ipc_key_to_object_keys(
+            key, chunk_hashes, list(range(num_object_groups))
+        )
 
         extra_count = compute_extra_count(tp_size, key.world_size)
 
-        self._ctx.storage_manager.finish_read_prefetched(
-            obj_keys, extra_count=extra_count
-        )
+        for obj_keys in all_obj_keys:
+            self._ctx.storage_manager.finish_read_prefetched(
+                obj_keys, extra_count=extra_count
+            )
 
     def end_session(self, request_id: str) -> None:
         """Remove the session for a finished request.
@@ -437,12 +456,20 @@ class LookupModule:
             return
 
         chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
-        obj_keys = ipc_key_to_object_keys(session.lookup_ipc_key, chunk_hashes, [0])[0]
+        key = session.lookup_ipc_key
+        layout_descs = self._ctx.layout_desc_registry.find(
+            key.model_name, key.world_size
+        )
+        num_object_groups = len(layout_descs) if layout_descs else 1
+        all_obj_keys = ipc_key_to_object_keys(
+            key, chunk_hashes, list(range(num_object_groups))
+        )
         # unified touch of all keys, which include retrieved and stored keys
         # TODO(chunxiaozheng): when l2 is enabled, the prefetched keys from l2 are temp
         #  and will be deleted after finish_read_prefetched, when we touch all keys,
         #  these keys has been deleted and will not be touched.
-        self._ctx.storage_manager.touch_l1_keys(obj_keys)
+        for obj_keys in all_obj_keys:
+            self._ctx.storage_manager.touch_l1_keys(obj_keys)
 
     # -----------------------------------------------------------------
     # Internal helpers

@@ -528,7 +528,7 @@ class KVLayerGroupsManager:
         # ``sw_size_chunks``. Switch to
         # ``self._object_groups[object_group_idx].sw_size_chunks`` once the
         # lookup/registry side supports multiple object groups.
-        return -1
+        return self._object_groups[object_group_idx].sw_size_chunks
 
     def calculate_num_blocks(self, kernel_group_idx: int, num_tokens: int) -> int:
         """Calculate the number of blocks for a given number of tokens in a
@@ -569,27 +569,24 @@ class KVLayerGroupsManager:
         # logic for sliding window has been implemented.
         # For now, we put all the kernel groups into one object group.
 
-        # chunk_size = self._lmcache_tokens_per_chunk
-        # groups_by_sw_size: dict[int, list[int]] = defaultdict(list)
-        # for kernel_group_idx, group in enumerate(self._kernel_groups):
-        #    if group.sw_size_tokens == -1:
-        #        sw_size_chunks = -1
-        #    else:
-        #        sw_size_chunks = (
-        #            group.sw_size_tokens + chunk_size - 1
-        #        ) // chunk_size
-        #    groups_by_sw_size[sw_size_chunks].append(kernel_group_idx)
-        # return [
-        #    ObjectGroupInfo(
-        #        kernel_group_indices=kernel_group_indices,
-        #        sw_size_chunks=sw_size_chunks,
-        #    )
-        #    for sw_size_chunks, kernel_group_indices in sorted(
-        #        groups_by_sw_size.items(), key=lambda kv: kv[1][0]
-        #    )
-        # ]
+        chunk_size = self._lmcache_tokens_per_chunk
+        groups_by_sw_size: dict[int, list[int]] = defaultdict(list)
+        for kernel_group_idx, group in enumerate(self._kernel_groups):
+            if group.sw_size_tokens == -1:
+                sw_size_chunks = -1
+            else:
+                sw_size_chunks = (
+                    group.sw_size_tokens + chunk_size - 1
+                ) // chunk_size
+            groups_by_sw_size[sw_size_chunks].append(kernel_group_idx)
         return [
-            ObjectGroupInfo(kernel_group_indices=list(range(len(self._kernel_groups))))
+            ObjectGroupInfo(
+                kernel_group_indices=kernel_group_indices,
+                sw_size_chunks=sw_size_chunks,
+            )
+            for sw_size_chunks, kernel_group_indices in sorted(
+                groups_by_sw_size.items(), key=lambda kv: kv[1][0]
+            )
         ]
 
     @staticmethod

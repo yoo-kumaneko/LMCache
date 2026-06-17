@@ -36,19 +36,24 @@ class ShmPoolInfo(TypedDict):
 
 @dataclass
 class _LayoutDescEntry:
-    """Stored layout descriptor and its active registration count."""
+    """Stored layout descriptor list and its active registration count.
 
-    layout_desc: MemoryLayoutDesc
+    ``layout_descs`` is indexed by object group id: one ``MemoryLayoutDesc``
+    per object group, in object-group order.
+    """
+
+    layout_descs: list[MemoryLayoutDesc]
     ref_count: int
 
 
 class LayoutDescRegistry:
-    """Thread-safe registry mapping (model_name, world_size) to MemoryLayoutDesc.
+    """Thread-safe registry mapping (model_name, world_size) to per-object-group
+    layout descriptors.
 
     Modules write to this registry when KV caches are registered.
     Consumers (e.g. LookupModule) read from it to find layout descriptors
     for prefetch tasks. Multiple worker instances can share the same
-    ``(model_name, world_size)`` entry, so the registry keeps the descriptor
+    ``(model_name, world_size)`` entry, so the registry keeps the descriptors
     until the last matching registration is unregistered.
     """
 
@@ -61,29 +66,30 @@ class LayoutDescRegistry:
         self,
         model_name: str,
         world_size: int,
-        layout_desc: MemoryLayoutDesc,
+        layout_descs: list[MemoryLayoutDesc],
     ) -> None:
-        """Register a layout descriptor for a (model_name, world_size) pair.
+        """Register layout descriptors for a (model_name, world_size) pair.
 
         Re-registering the same pair increments the active registration
-        count. The latest descriptor is retained for lookups.
+        count. The latest descriptors are retained for lookups.
 
         Args:
             model_name: The model name.
             world_size: The world size.
-            layout_desc: The memory layout descriptor.
+            layout_descs: One ``MemoryLayoutDesc`` per object group, in
+                object-group order.
         """
         key = (model_name, world_size)
         with self._lock:
             entry = self._registry.get(key)
             if entry is None:
                 self._registry[key] = _LayoutDescEntry(
-                    layout_desc=layout_desc,
+                    layout_descs=layout_descs,
                     ref_count=1,
                 )
                 return
 
-            entry.layout_desc = layout_desc
+            entry.layout_descs = layout_descs
             entry.ref_count += 1
 
     def unregister(self, model_name: str, world_size: int) -> None:
@@ -108,21 +114,24 @@ class LayoutDescRegistry:
 
             entry.ref_count -= 1
 
-    def find(self, model_name: str, world_size: int) -> MemoryLayoutDesc | None:
-        """Look up a layout descriptor by (model_name, world_size).
+    def find(
+        self, model_name: str, world_size: int
+    ) -> list[MemoryLayoutDesc] | None:
+        """Look up layout descriptors by (model_name, world_size).
 
         Args:
             model_name: The model name.
             world_size: The world size.
 
         Returns:
-            The layout descriptor if found, otherwise None.
+            The list of layout descriptors (one per object group) if found,
+            otherwise None.
         """
         with self._lock:
             entry = self._registry.get((model_name, world_size))
             if entry is None:
                 return None
-            return entry.layout_desc
+            return entry.layout_descs
 
 
 class MPCacheServerContext:

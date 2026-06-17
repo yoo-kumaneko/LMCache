@@ -450,10 +450,10 @@ class TestKernelAndObjectGroups:
         assert manager.get_slots_per_chunk_in_sw(1) == 64
         assert manager.get_slots_per_chunk_in_sw(2) == 256
 
-    def test_mixed_sw_kernel_groups_share_single_object_group(self):
-        # Object-level bucketing by sliding window size is not enabled yet:
-        # kernel groups with differing window sizes still land in ONE object
-        # group and get_sw_size_chunks stays -1.
+    def test_mixed_sw_kernel_groups_split_into_object_groups(self):
+        # Kernel groups with different sliding window sizes are split into
+        # separate object groups: full-attention (-1), sub-chunk sw (1 chunk),
+        # and cross-chunk sw (2 chunks) each get their own object group.
         tensors = [
             torch.randn(2, 32, 32, 8, 64, dtype=torch.float16),
             torch.randn(2, 32, 32, 16, 64, dtype=torch.float16),
@@ -468,11 +468,21 @@ class TestKernelAndObjectGroups:
                 EngineGroupInfo(0, (2,), sw_size_tokens=512),
             ],
         )
-        assert manager.num_object_groups == 1
-        obj = manager.object_groups[0]
-        assert obj.kernel_group_indices == list(range(manager.num_kernel_groups))
-        assert obj.sw_size_chunks == -1
-        assert manager.get_sw_size_chunks(0) == -1
+        # default chunk_size=256: sw=64 -> ceil(64/256)=1; sw=512 -> ceil(512/256)=2
+        assert manager.num_object_groups == 3
+        sw_chunks = sorted(og.sw_size_chunks for og in manager.object_groups)
+        assert sw_chunks == [-1, 1, 2]
+        # get_sw_size_chunks reads the real object group value
+        og_by_sw = {og.sw_size_chunks: og for og in manager.object_groups}
+        assert manager.get_sw_size_chunks(
+            manager.object_groups.index(og_by_sw[-1])
+        ) == -1
+        assert manager.get_sw_size_chunks(
+            manager.object_groups.index(og_by_sw[1])
+        ) == 1
+        assert manager.get_sw_size_chunks(
+            manager.object_groups.index(og_by_sw[2])
+        ) == 2
 
     def test_empty_manager_has_no_groups(self):
         # Empty registration returns early in __init__; both group lists must
